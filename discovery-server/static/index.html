@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>HVAC Rack Monitor</title>
+<link rel="stylesheet" href="/static/style.css" />
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <header>
+    <h1>HVAC&nbsp;Rack&nbsp;Monitor</h1>
+    <div class="status">
+      <span id="conn" class="dot off"></span>
+      <span id="conn-text">connecting…</span>
+      <span id="node-id" class="muted"></span>
+    </div>
+    <nav>
+      <button data-view="mesh" class="active">3D&nbsp;Rack</button>
+      <button data-view="log">Log</button>
+    </nav>
+  </header>
+
+  <main>
+    <!-- 3D view -->
+    <section id="view-mesh" class="view active">
+      <div id="canvas-wrap"></div>
+      <div id="legend">
+        <span class="cold">cold</span>
+        <div class="bar"></div>
+        <span class="hot">hot</span>
+      </div>
+    </section>
+
+    <!-- Log / spreadsheet view -->
+    <section id="view-log" class="view">
+      <div class="toolbar">
+        <button id="export-csv">Export CSV</button>
+        <span id="row-count" class="muted"></span>
+      </div>
+      <div class="table-wrap">
+        <table id="log-table">
+          <thead>
+            <tr>
+              <th>#</th><th>Time</th><th>Box</th><th>Slot</th>
+              <th>Sensor</th><th>Probes (°C)</th><th>Avg</th><th>Max</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <!-- Analytics drawer (opens on box click) -->
+  <aside id="drawer" class="hidden">
+    <div class="drawer-head">
+      <h2 id="drawer-title">Box</h2>
+      <button id="drawer-close">×</button>
+    </div>
+    <div class="drawer-body">
+      <div class="stat-grid" id="stat-grid"></div>
+      <canvas id="trend-chart" height="160"></canvas>
+      <h3>Per-probe (latest)</h3>
+      <canvas id="probe-chart" height="160"></canvas>
+    </div>
+  </aside>
+
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>
