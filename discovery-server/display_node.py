@@ -101,28 +101,37 @@ def init_db() -> None:
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rd_ts ON readings(ts)")
-        # EUI-64 -> physical box/slot, assigned at commissioning (option 1).
+        # EUI-64 -> physical box/slot + human-readable location label, assigned
+        # at commissioning. box/slot drive the legacy 3D grid; label is the
+        # rich "Rack / Unit / Port" location chosen in the app.
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS sensor_map (
-                eui  TEXT PRIMARY KEY,
-                box  INTEGER,
-                slot TEXT
+                eui   TEXT PRIMARY KEY,
+                box   INTEGER,
+                slot  TEXT,
+                label TEXT
             )
             """
         )
+        # Backfill the label column on databases created before it existed.
+        try:
+            conn.execute("ALTER TABLE sensor_map ADD COLUMN label TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already present
 
 
-# EUI -> (box, slot) cache, loaded from sensor_map. Keys are lower-case hex.
-EUI_MAP: dict[str, tuple[int, str]] = {}
+# EUI -> (box, slot, label) cache, loaded from sensor_map. Keys are lower-case hex.
+EUI_MAP: dict[str, tuple[int, str, str]] = {}
 
 
 def load_map() -> None:
     EUI_MAP.clear()
     with db() as conn:
-        for r in conn.execute("SELECT eui, box, slot FROM sensor_map"):
-            EUI_MAP[r["eui"].lower()] = (int(r["box"]), (r["slot"] or "A").upper())
-    print(f"[map] loaded {len(EUI_MAP)} EUI->box/slot mappings")
+        for r in conn.execute("SELECT eui, box, slot, label FROM sensor_map"):
+            EUI_MAP[r["eui"].lower()] = (
+                int(r["box"]), (r["slot"] or "A").upper(), r["label"] or "")
+    print(f"[map] loaded {len(EUI_MAP)} EUI->location mappings")
 
 
 # --------------------------------------------------------------------------- #
@@ -164,11 +173,16 @@ broker = Broker()
 # By convention sensor ids look like "box3-A" / "box3-B"; anything else gets
 # hashed onto a box so it still shows up somewhere instead of being dropped.
 
-def map_to_box(sensor_id: str, box: int | None, slot: str | None) -> tuple[int, str]:
+def map_to_box(sensor_id: str, box: int | None, slot: str | None) -> tuple[int, str, str]:
     if box is not None:
-        return int(box), (slot or "A").upper()
+        # An explicit box still picks up its commissioned label if we have one.
+        label = ""
+        mapped = EUI_MAP.get(sensor_id.lower())
+        if mapped:
+            label = mapped[2]
+        return int(box), (slot or "A").upper(), label
 
-    # Commissioned EUI -> box/slot table takes priority (sensors report their EUI).
+    # Commissioned EUI -> location table takes priority (sensors report their EUI).
     mapped = EUI_MAP.get(sensor_id.lower())
     if mapped:
         return mapped
@@ -181,13 +195,13 @@ def map_to_box(sensor_id: str, box: int | None, slot: str | None) -> tuple[int, 
             b = int(num_part)
             s = (slot_part or "A").upper()
             if 1 <= b <= NUM_BOXES and s in ("A", "B"):
-                return b, s
+                return b, s, ""
         except ValueError:
             pass
 
     # Fallback: deterministic placement so unknown sensors are still visible.
     h = sum(ord(c) for c in sensor_id)
-    return (h % NUM_BOXES) + 1, "AB"[h % 2]
+    return (h % NUM_BOXES) + 1, "AB"[h % 2], ""
 
 
 def ingest_reading(sensor_id: str, probes: list[float],
@@ -195,9 +209,9 @@ def ingest_reading(sensor_id: str, probes: list[float],
                    ts: float | None = None) -> dict[str, Any]:
     """Single entry point for BOTH serial and http ingest paths."""
     ts = ts or time.time()
-    b, s = map_to_box(sensor_id, box, slot)
+    b, s, label = map_to_box(sensor_id, box, slot)
     record = {
-        "ts": ts, "box": b, "slot": s,
+        "ts": ts, "box": b, "slot": s, "label": label,
         "sensor_id": sensor_id, "probes": probes,
     }
     with db() as conn:
@@ -368,27 +382,33 @@ class MapBody(BaseModel):
     eui: str
     box: int
     slot: str = "A"
+    label: str = ""
 
 
 @app.post("/map")
 def set_map(body: MapBody):
-    """Assign a sensor's EUI-64 to a physical box/slot (called at commissioning)."""
+    """Assign a sensor's EUI-64 to a physical location (called at commissioning).
+
+    box/slot keep the legacy 3D grid working; label is the rich
+    "Rack / Unit / Port" location chosen in the app."""
     eui = body.eui.lower()
     slot = (body.slot or "A").upper()
+    label = body.label or ""
     with db() as conn:
         conn.execute(
-            "INSERT INTO sensor_map(eui, box, slot) VALUES(?,?,?) "
-            "ON CONFLICT(eui) DO UPDATE SET box=?, slot=?",
-            (eui, body.box, slot, body.box, slot),
+            "INSERT INTO sensor_map(eui, box, slot, label) VALUES(?,?,?,?) "
+            "ON CONFLICT(eui) DO UPDATE SET box=?, slot=?, label=?",
+            (eui, body.box, slot, label, body.box, slot, label),
         )
-    EUI_MAP[eui] = (body.box, slot)
-    print(f"[map] {eui} -> box{body.box}-{slot}")
-    return {"ok": True, "eui": eui, "box": body.box, "slot": slot}
+    EUI_MAP[eui] = (body.box, slot, label)
+    print(f"[map] {eui} -> box{body.box}-{slot} ({label})")
+    return {"ok": True, "eui": eui, "box": body.box, "slot": slot, "label": label}
 
 
 @app.get("/map")
 def get_map():
-    return {"map": [{"eui": k, "box": v[0], "slot": v[1]} for k, v in EUI_MAP.items()]}
+    return {"map": [{"eui": k, "box": v[0], "slot": v[1], "label": v[2]}
+                    for k, v in EUI_MAP.items()]}
 
 
 @app.get("/poll")
