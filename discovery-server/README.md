@@ -3,13 +3,13 @@
 Three cooperating pieces:
 
 ```
-  ┌──────────────┐  heartbeat (presence = internet up)   ┌────────────────────┐
-  │   sensors    │ ────────────────────────────────────► │  discovery_server  │
+  ┌──────────────┐  heartbeat (presence = internet up)    ┌────────────────────┐
+  │   sensors    │ ─────────────────────────────────────► │  discovery_server  │
   │ box{n}-A/B   │ ◄──────── /discover (node LAN ip) ──── │   (cloud / remote) │
   └──────┬───────┘                                        │  sqlite + email    │
          │  P2P /ingest (probe temps)                     └─────────┬──────────┘
          ▼                                                          │ if no heartbeat
-  ┌──────────────┐   serves dashboard + long-poll                  ▼ → send email
+  ┌──────────────┐   serves dashboard + long-poll                   ▼ → send email
   │ display_node │   (on the user's computer, LAN)            ops@... gets alerted
   │  + browser   │
   └──────────────┘
