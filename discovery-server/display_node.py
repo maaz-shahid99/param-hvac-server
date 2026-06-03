@@ -433,6 +433,26 @@ def index():
     return FileResponse(os.path.join(STATIC_DIR, "index.html"))
 
 
+# --- OTA firmware hosting ---------------------------------------------------
+# Drop the built images + a manifest into ./firmware:
+#   firmware/manifest.json  e.g.
+#     {"c3_version": 2, "c3_file": "bridge.bin",
+#      "c6_version": 2, "c6_file": "commissioner.bin"}
+#   firmware/bridge.bin       (C3 / Bridge build)
+#   firmware/commissioner.bin (C6 / Commissioner build)
+FIRMWARE_DIR = os.path.join(HERE, "firmware")
+os.makedirs(FIRMWARE_DIR, exist_ok=True)
+
+
+@app.get("/firmware/manifest.json")
+def firmware_manifest():
+    path = os.path.join(FIRMWARE_DIR, "manifest.json")
+    if os.path.exists(path):
+        return FileResponse(path, media_type="application/json")
+    return {"c3_version": 0, "c6_version": 0}   # nothing published yet
+
+
+app.mount("/firmware", StaticFiles(directory=FIRMWARE_DIR), name="firmware")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
