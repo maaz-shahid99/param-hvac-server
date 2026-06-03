@@ -1,0 +1,14 @@
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.5.0
+SQLAlchemy>=2.0.0
+# Postgres driver for AWS RDS (DATABASE_URL=postgresql+psycopg://...).
+# Not needed for the SQLite local-dev default.
+psycopg[binary]>=3.1.0
+# Password hashing + JWT for the simple email/password auth.
+bcrypt>=4.1.0
+PyJWT>=2.8.0
+# AWS SES (email) + SNS (SMS/push). Optional at runtime: if boto3 is absent or
+# AWS is unconfigured, notifications fall back to logging (like the discovery
+# server's SMTP-skipped path), so the service still runs locally.
+boto3>=1.34.0
