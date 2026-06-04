@@ -198,7 +198,7 @@ def _scan_stale() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    config.validate_production()   # fail fast on insecure prod config (no-op in dev)
+    config.validate_startup()   # fail fast on insecure onprem/prod config (no-op in dev)
     init_db()
     task = asyncio.create_task(stale_watchdog())
     try:
