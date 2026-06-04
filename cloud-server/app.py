@@ -20,12 +20,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 import config
@@ -49,6 +51,7 @@ from db import (
     Reading,
     SensorMap,
     SessionLocal,
+    SingletonLease,
     Tenant,
     Threshold,
     Topology,
@@ -129,11 +132,45 @@ def rebuild_sensor_map(db: Session, tenant_id: str, topo: dict) -> int:
 # Stale-sensor watchdog                                                        #
 # --------------------------------------------------------------------------- #
 
+# A unique id for THIS process, used to claim the watchdog leader lease.
+_INSTANCE_ID = uuid.uuid4().hex
+
+
+def _acquire_lease(name: str, ttl: float) -> bool:
+    """Try to hold/renew a named leader lease. Returns True iff this process is
+    the current holder. Safe to call from every worker each tick: only one wins.
+    The lease is taken for `ttl` seconds (> the tick interval) so the holder
+    keeps it across ticks and a dead holder is replaced after it lapses."""
+    t = now()
+    with SessionLocal() as db:
+        lease = db.get(SingletonLease, name)
+        if lease is None:
+            try:
+                db.add(SingletonLease(name=name, holder=_INSTANCE_ID, expires_at=t + ttl))
+                db.commit()
+                return True
+            except IntegrityError:        # another worker inserted first
+                db.rollback()
+                lease = db.get(SingletonLease, name)
+        if lease is None:
+            return False
+        if lease.holder == _INSTANCE_ID or lease.expires_at < t:
+            lease.holder = _INSTANCE_ID
+            lease.expires_at = t + ttl
+            db.commit()
+            return True
+        return False
+
+
 async def stale_watchdog() -> None:
+    # Lease lives longer than a tick so the holder renews before it lapses; if
+    # the holder dies, a follower takes over within ~one lease period.
+    lease_ttl = config.WATCHDOG_INTERVAL_S * 3
     while True:
         await asyncio.sleep(config.WATCHDOG_INTERVAL_S)
         try:
-            _scan_stale()
+            if _acquire_lease("stale_watchdog", lease_ttl):
+                _scan_stale()
         except Exception as exc:  # noqa: BLE001
             print(f"[watchdog] error: {exc}")
 

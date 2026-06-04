@@ -8,6 +8,8 @@ psycopg[binary]>=3.1.0
 # Password hashing + JWT for the simple email/password auth.
 bcrypt>=4.1.0
 PyJWT>=2.8.0
+# Schema migrations (prod: `alembic upgrade head` before starting the app).
+alembic>=1.13.0
 # AWS SES (email) + SNS (SMS/push). Optional at runtime: if boto3 is absent or
 # AWS is unconfigured, notifications fall back to logging (like the discovery
 # server's SMTP-skipped path), so the service still runs locally.

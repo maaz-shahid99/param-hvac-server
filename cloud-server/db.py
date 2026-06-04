@@ -165,5 +165,21 @@ class Alert(Base):
     __table_args__ = (Index("ix_alert_open", "tenant_id", "eui", "kind", "state"),)
 
 
+class SingletonLease(Base):
+    """A short-lived leader lease so exactly one process runs a singleton job
+    (the stale-sensor watchdog) even when the API is scaled to many workers.
+    The holder renews before `expires_at`; if it dies, another worker takes over
+    once the lease lapses. Portable across SQLite (dev) and Postgres (prod)."""
+    __tablename__ = "singleton_leases"
+    name: Mapped[str] = mapped_column(String(64), primary_key=True)
+    holder: Mapped[str] = mapped_column(String(64), default="")
+    expires_at: Mapped[float] = mapped_column(Float, default=0.0)
+
+
 def init_db() -> None:
-    Base.metadata.create_all(engine)
+    """Bootstrap the schema for local dev / tests on SQLite. On a real database
+    (Postgres) the schema is owned by Alembic — run `alembic upgrade head`
+    before starting the app — so we DON'T create_all there (it would race with
+    and confuse migrations)."""
+    if DATABASE_URL.startswith("sqlite"):
+        Base.metadata.create_all(engine)

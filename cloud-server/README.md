@@ -39,8 +39,23 @@ Smoke-test the whole alert loop:
 python test_local.py        # register -> ingest hot reading -> alert -> clear
 ```
 
+## Database migrations (Alembic)
+Local dev on SQLite auto-creates the schema, so you don't need Alembic to run
+`test_local.py` or develop. **Production owns the schema through Alembic** — the
+app no longer `create_all`s on Postgres.
+
+```bash
+# point at the target DB, then apply all migrations
+export DATABASE_URL=postgresql+psycopg://USER:PASS@HOST:5432/hvac
+alembic upgrade head            # run this on every deploy, before starting uvicorn
+
+# after changing a model, generate a migration and review it before committing
+alembic revision --autogenerate -m "describe change"
+alembic check                   # CI: fails if models drifted from migrations
+```
+
 ## Deploy on AWS (Phase 1 checklist — needs your AWS account)
-1. **RDS Postgres** → set `DATABASE_URL=postgresql+psycopg://USER:PASS@HOST:5432/hvac`.
+1. **RDS Postgres** → set `DATABASE_URL=postgresql+psycopg://USER:PASS@HOST:5432/hvac`, then `alembic upgrade head`.
 2. **SES** → verify a sender, set `SES_FROM`. (Leave blank to keep logging.)
 3. **SNS** → set `SNS_SMS_ENABLED=1` for SMS. Creds via the instance IAM role.
 4. Set a strong `JWT_SECRET` and a real `BOOTSTRAP_TOKEN`.

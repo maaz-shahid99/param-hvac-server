@@ -1,0 +1,23 @@
+# systemd unit to run the Cloud Server (behind the Nginx TLS proxy).
+# Install:  sudo cp hvac-cloud.service /etc/systemd/system/ && sudo systemctl enable --now hvac-cloud
+#
+# Migrations run as a one-shot BEFORE the app starts (ExecStartPre), so the
+# schema is always current on deploy. Secrets come from /etc/hvac-cloud.env
+# (DATABASE_URL, JWT_SECRET, BOOTSTRAP_TOKEN, SES_FROM, AWS_REGION, …).
+
+[Unit]
+Description=HVAC Cloud Server (FastAPI)
+After=network.target
+
+[Service]
+Type=simple
+User=hvac
+WorkingDirectory=/opt/hvac/Cloud Server
+EnvironmentFile=/etc/hvac-cloud.env
+ExecStartPre=/opt/hvac/venv/bin/alembic upgrade head
+ExecStart=/opt/hvac/venv/bin/uvicorn app:app --host 127.0.0.1 --port 8002 --workers 4
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
