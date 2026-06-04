@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 import uuid
 from collections import defaultdict, deque
@@ -27,6 +28,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
@@ -677,6 +679,43 @@ def set_recipients(body: RecipientsBody, p: Principal = Depends(require_admin),
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+# --------------------------------------------------------------------------- #
+# Web dashboard (optional) — serve the built React app at the root            #
+# --------------------------------------------------------------------------- #
+# If the dashboard has been built (web-dashboard/dist), serve it from the same
+# origin as the API. Same-origin means the browser needs NO CORS, and there's a
+# single URL to hand out. Build it with `npm run build` in ../web-dashboard, or
+# point WEB_DIR at the built dir. This block is a no-op if the dir is absent.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+WEB_DIR = os.path.abspath(
+    os.environ.get("WEB_DIR", os.path.join(_HERE, "..", "web-dashboard", "dist"))
+)
+_API_PREFIXES = ("v1/", "v1", "health", "docs", "redoc", "openapi.json")
+
+if os.path.isdir(WEB_DIR):
+    _INDEX = os.path.join(WEB_DIR, "index.html")
+
+    @app.get("/")
+    def _spa_root():
+        return FileResponse(_INDEX)
+
+    @app.get("/{full_path:path}")
+    def _spa(full_path: str):
+        # Never shadow the API — let unknown API paths 404 as usual.
+        if full_path.startswith(_API_PREFIXES):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found")
+        # Serve a real built asset if it exists (guard against path traversal);
+        # otherwise fall back to index.html so client-side routing works.
+        candidate = os.path.normpath(os.path.join(WEB_DIR, full_path))
+        if candidate.startswith(WEB_DIR) and os.path.isfile(candidate):
+            return FileResponse(candidate)
+        return FileResponse(_INDEX)
+
+    print(f"[web] serving dashboard from {WEB_DIR} at /")
+else:
+    print(f"[web] dashboard not built ({WEB_DIR} missing) — API only")
 
 
 if __name__ == "__main__":
