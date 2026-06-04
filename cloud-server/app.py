@@ -270,13 +270,12 @@ class LoginBody(BaseModel):
     password: str
 
 
-def _auth_payload(user: User, tenant: Tenant | None = None) -> dict:
-    out = {"token": issue_token(user), "tenant_id": user.tenant_id,
-           "role": user.role, "status": user.status, "name": user.name,
-           "email": user.email, "phone": user.phone}
-    if tenant is not None:
-        out["org_code"] = tenant.org_code
-    return out
+def _auth_payload(db: Session, user: User) -> dict:
+    tenant = db.get(Tenant, user.tenant_id)
+    return {"token": issue_token(user), "tenant_id": user.tenant_id,
+            "role": user.role, "status": user.status, "name": user.name,
+            "email": user.email, "phone": user.phone,
+            "org_code": tenant.org_code if tenant else ""}
 
 
 @app.post("/v1/auth/register")
@@ -300,7 +299,7 @@ def register(body: RegisterBody, db: Session = Depends(get_db),
                 role="admin", status="active", email_enabled=True, sms_enabled=bool(body.phone))
     db.add(user)
     db.commit()
-    return _auth_payload(user, tenant)
+    return _auth_payload(db, user)
 
 
 @app.post("/v1/auth/join")
@@ -322,7 +321,7 @@ def join(body: JoinBody, db: Session = Depends(get_db),
                 email_enabled=False, sms_enabled=False)
     db.add(user)
     db.commit()
-    return _auth_payload(user, tenant)
+    return _auth_payload(db, user)
 
 
 @app.post("/v1/auth/login")
@@ -333,7 +332,7 @@ def login(body: LoginBody, db: Session = Depends(get_db),
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid credentials")
     if user.status == "rejected":
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Your join request was declined")
-    return _auth_payload(user)
+    return _auth_payload(db, user)
 
 
 @app.get("/v1/me")
@@ -342,8 +341,10 @@ def me(p: Principal = Depends(current_principal), db: Session = Depends(get_db))
     u = db.get(User, p.user_id)
     if not u:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "User not found")
+    tenant = db.get(Tenant, u.tenant_id)
     return {"role": u.role, "status": u.status, "name": u.name,
             "email": u.email, "phone": u.phone,
+            "org_code": tenant.org_code if tenant else "",
             "email_enabled": u.email_enabled, "sms_enabled": u.sms_enabled}
 
 
