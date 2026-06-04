@@ -20,10 +20,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import uuid
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, select
@@ -196,6 +198,7 @@ def _scan_stale() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    config.validate_production()   # fail fast on insecure prod config (no-op in dev)
     init_db()
     task = asyncio.create_task(stale_watchdog())
     try:
@@ -206,8 +209,31 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="HVAC Cloud Server", lifespan=lifespan)
 app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
+    CORSMiddleware, allow_origins=config.CORS_ORIGINS,
+    allow_methods=["*"], allow_headers=["*"],
 )
+
+
+# ---- per-IP rate limit for auth endpoints ---------------------------------- #
+# In-memory sliding window; mitigates password/OTP brute-force and registration
+# spam. Per-process, so behind N workers the effective limit is N*max — use a
+# shared store (Redis) if you need a hard global limit at scale.
+_rl_hits: dict[str, deque] = defaultdict(deque)
+
+
+def rate_limit(request: Request) -> None:
+    # Honour X-Forwarded-For (set by the Nginx/ALB proxy) so we limit the real
+    # client, not the proxy.
+    fwd = request.headers.get("x-forwarded-for", "")
+    ip = fwd.split(",")[0].strip() if fwd else (request.client.host if request.client else "?")
+    key = f"{request.url.path}:{ip}"
+    win, now_t = config.AUTH_RATE_WINDOW_S, time.time()
+    dq = _rl_hits[key]
+    while dq and dq[0] < now_t - win:
+        dq.popleft()
+    if len(dq) >= config.AUTH_RATE_MAX:
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Too many requests; slow down.")
+    dq.append(now_t)
 
 
 # ---- auth ------------------------------------------------------------------ #
@@ -225,7 +251,8 @@ class LoginBody(BaseModel):
 
 
 @app.post("/v1/auth/register")
-def register(body: RegisterBody, db: Session = Depends(get_db)):
+def register(body: RegisterBody, db: Session = Depends(get_db),
+             _rl: None = Depends(rate_limit)):
     """Bootstrap a new tenant + its first admin user. Guarded by BOOTSTRAP_TOKEN."""
     if not config.BOOTSTRAP_TOKEN or body.bootstrap_token != config.BOOTSTRAP_TOKEN:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Bad bootstrap token")
@@ -241,7 +268,8 @@ def register(body: RegisterBody, db: Session = Depends(get_db)):
 
 
 @app.post("/v1/auth/login")
-def login(body: LoginBody, db: Session = Depends(get_db)):
+def login(body: LoginBody, db: Session = Depends(get_db),
+          _rl: None = Depends(rate_limit)):
     user = db.scalar(select(User).where(User.email == body.email.lower()))
     if not user or not verify_password(body.password, user.password_hash):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid credentials")
@@ -261,7 +289,8 @@ class ResetBody(BaseModel):
 
 
 @app.post("/v1/auth/forgot")
-def forgot_password(body: ForgotBody, db: Session = Depends(get_db)):
+def forgot_password(body: ForgotBody, db: Session = Depends(get_db),
+                    _rl: None = Depends(rate_limit)):
     """Email a 6-digit reset code. ALWAYS returns 200 and never reveals whether
     the email exists (anti-enumeration). Any previous code for this email is
     invalidated. Locally (no SES) the code is printed to the server log."""
@@ -283,7 +312,8 @@ def forgot_password(body: ForgotBody, db: Session = Depends(get_db)):
 
 
 @app.post("/v1/auth/reset")
-def reset_password(body: ResetBody, db: Session = Depends(get_db)):
+def reset_password(body: ResetBody, db: Session = Depends(get_db),
+                   _rl: None = Depends(rate_limit)):
     """Verify the emailed code and set a new password. Generic errors avoid
     leaking which of email/code was wrong; the code dies after OTP_MAX_ATTEMPTS."""
     if len(body.new_password) < config.MIN_PASSWORD_LEN:

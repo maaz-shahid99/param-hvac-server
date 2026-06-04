@@ -50,5 +50,43 @@ AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 SES_FROM = os.environ.get("SES_FROM", "")
 SNS_SMS_ENABLED = os.environ.get("SNS_SMS_ENABLED", "0") not in ("", "0", "false", "False")
 
+# --- Hardening -------------------------------------------------------------
+# Set ENV=production to enforce the checks in validate_production() on startup.
+ENV = os.environ.get("ENV", "dev").lower()
+IS_PROD = ENV in ("prod", "production")
+
+# Allowed CORS origins (comma-separated). Default "*" is fine for local dev but
+# is REJECTED in production by validate_production() — set an explicit allowlist.
+CORS_ORIGINS = [o.strip() for o in os.environ.get("CORS_ORIGINS", "*").split(",") if o.strip()]
+
+# Per-IP sliding-window rate limit on the auth endpoints (login/register/forgot/
+# reset). In-memory per process; behind many workers use a shared store (Redis).
+AUTH_RATE_MAX = _i("AUTH_RATE_MAX", 10)
+AUTH_RATE_WINDOW_S = _f("AUTH_RATE_WINDOW_S", 60.0)
+
+_INSECURE_JWT = "dev-insecure-change-me"
+_INSECURE_BOOTSTRAP = "dev-bootstrap"
+
+
+def validate_production() -> None:
+    """In production (ENV=production), refuse to start with dev placeholders or
+    an unsafe configuration. No-op in dev so local work stays frictionless."""
+    if not IS_PROD:
+        return
+    problems = []
+    if JWT_SECRET == _INSECURE_JWT or len(JWT_SECRET) < 32:
+        problems.append("JWT_SECRET must be a strong random value (>= 32 chars)")
+    if BOOTSTRAP_TOKEN == _INSECURE_BOOTSTRAP:
+        problems.append("BOOTSTRAP_TOKEN must be changed (or set empty to disable registration)")
+    if CORS_ORIGINS == ["*"]:
+        problems.append("CORS_ORIGINS must be an explicit allowlist, not '*'")
+    if DATABASE_URL.startswith("sqlite"):
+        problems.append("DATABASE_URL must point at Postgres (not SQLite) in production")
+    if problems:
+        raise RuntimeError(
+            "Refusing to start: insecure production config —\n  - " + "\n  - ".join(problems)
+        )
+
+
 # --- Server ----------------------------------------------------------------
 PORT = _i("PORT", 8002)

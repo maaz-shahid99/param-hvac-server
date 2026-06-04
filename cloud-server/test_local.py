@@ -153,4 +153,13 @@ with client:  # triggers lifespan (init_db + watchdog)
         "email": "admin@acme.test", "otp": code, "new_password": "again123",
     }).status_code == 400, "code is single-use (cannot replay)")
 
+    print("13) auth rate limiting (per-IP sliding window)")
+    import config as cfg
+    cfg.AUTH_RATE_MAX = 3                 # tighten + reset the window for a deterministic check
+    appmod._rl_hits.clear()
+    codes = [client.post("/v1/auth/login",
+                         json={"email": "x@y.z", "password": "nope"}).status_code
+             for _ in range(5)]
+    check(429 in codes, f"login is rate-limited past the cap ({codes})")
+
 print("\nALL CHECKS PASSED")
