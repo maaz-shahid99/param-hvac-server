@@ -158,6 +158,19 @@ class Reading(Base):
     __table_args__ = (Index("ix_reading_tenant_ts", "tenant_id", "ts"),)
 
 
+class MeshNode(Base):
+    """A non-sensor Thread mesh device (a router) the gateway reported via
+    /v1/mesh. Routers don't send readings, so this is the only record of their
+    existence + liveness; `online` is derived from `last_seen` freshness."""
+    __tablename__ = "mesh_nodes"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    tenant_id: Mapped[str] = mapped_column(String(32), ForeignKey("tenants.id"), index=True)
+    eui: Mapped[str] = mapped_column(String(32), index=True)          # lower-case hex
+    kind: Mapped[str] = mapped_column(String(16), default="router")
+    last_seen: Mapped[float] = mapped_column(Float, default=now)
+    __table_args__ = (Index("ix_meshnode_tenant_eui", "tenant_id", "eui", unique=True),)
+
+
 class Alert(Base):
     """An open or historical alert. One open alert per (tenant, eui, kind)."""
     __tablename__ = "alerts"

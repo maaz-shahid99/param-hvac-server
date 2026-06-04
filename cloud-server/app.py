@@ -52,6 +52,7 @@ from auth import (
 from db import (
     Alert,
     ApiKey,
+    MeshNode,
     PasswordReset,
     Reading,
     SensorMap,
@@ -550,6 +551,34 @@ def ingest(body: IngestBody, tenant_id: str = Depends(tenant_from_api_key),
     return {"ok": True, "eui": eui, "max_c": mx}
 
 
+# ---- mesh roster (routers) ------------------------------------------------- #
+
+class MeshBody(BaseModel):
+    routers: list[dict] = []   # [{"eui": "..."}]
+
+
+@app.post("/v1/mesh")
+def ingest_mesh(body: MeshBody, tenant_id: str = Depends(tenant_from_api_key),
+                db: Session = Depends(get_db)):
+    """Gateway posts the live router roster (routers have no readings of their
+    own). Upserts each as a MeshNode with a fresh last_seen; the dashboard
+    derives online/offline from that timestamp."""
+    ts = now()
+    seen = 0
+    for r in body.routers:
+        eui = str(r.get("eui", "")).strip().lower()
+        if not eui:
+            continue
+        row = db.scalar(select(MeshNode).where(MeshNode.tenant_id == tenant_id, MeshNode.eui == eui))
+        if row:
+            row.last_seen = ts
+        else:
+            db.add(MeshNode(tenant_id=tenant_id, eui=eui, kind="router", last_seen=ts))
+        seen += 1
+    db.commit()
+    return {"ok": True, "routers": seen}
+
+
 # ---- topology sync (replaces app-local SharedPreferences) ------------------ #
 
 class TopologyBody(BaseModel):
@@ -632,6 +661,17 @@ def current(p: Principal = Depends(current_principal), db: Session = Depends(get
                     "probes": json.loads(r.probes),
                     "location": (sm.label if sm else ""), "box": r.box, "slot": r.slot})
     return {"sensors": out}
+
+
+@app.get("/v1/routers")
+def list_routers(p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    """Routers the gateway has reported, with online/offline from last_seen.
+    Online if seen within the same stale window the watchdog uses for sensors."""
+    cutoff = now() - config.STALE_AFTER_S
+    rows = db.scalars(select(MeshNode).where(MeshNode.tenant_id == p.tenant_id)
+                      .order_by(MeshNode.last_seen.desc())).all()
+    return {"routers": [{"eui": m.eui, "kind": m.kind, "last_seen": m.last_seen,
+                         "online": m.last_seen >= cutoff} for m in rows]}
 
 
 @app.get("/v1/alerts")
