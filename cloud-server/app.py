@@ -554,29 +554,38 @@ def ingest(body: IngestBody, tenant_id: str = Depends(tenant_from_api_key),
 # ---- mesh roster (routers) ------------------------------------------------- #
 
 class MeshBody(BaseModel):
-    routers: list[dict] = []   # [{"eui": "..."}]
+    nodes: list[dict] = []     # [{"eui": "...", "role": "G|R"}]
+    routers: list[dict] = []   # legacy: [{"eui": "..."}] (treated as routers)
 
 
 @app.post("/v1/mesh")
 def ingest_mesh(body: MeshBody, tenant_id: str = Depends(tenant_from_api_key),
                 db: Session = Depends(get_db)):
-    """Gateway posts the live router roster (routers have no readings of their
-    own). Upserts each as a MeshNode with a fresh last_seen; the dashboard
-    derives online/offline from that timestamp."""
+    """Gateway posts the live C6 mesh roster (gateway + routers — these have no
+    readings of their own). Upserts each as a MeshNode with a fresh last_seen +
+    kind; the dashboard derives online/offline from the timestamp, and the
+    'gateway' kind moves on failover."""
     ts = now()
-    seen = 0
-    for r in body.routers:
+    items: list[tuple[str, str]] = []
+    for n in body.nodes:
+        eui = str(n.get("eui", "")).strip().lower()
+        if eui:
+            kind = "gateway" if str(n.get("role", "R")).upper() == "G" else "router"
+            items.append((eui, kind))
+    for r in body.routers:   # legacy clients
         eui = str(r.get("eui", "")).strip().lower()
-        if not eui:
-            continue
+        if eui:
+            items.append((eui, "router"))
+
+    for eui, kind in items:
         row = db.scalar(select(MeshNode).where(MeshNode.tenant_id == tenant_id, MeshNode.eui == eui))
         if row:
             row.last_seen = ts
+            row.kind = kind
         else:
-            db.add(MeshNode(tenant_id=tenant_id, eui=eui, kind="router", last_seen=ts))
-        seen += 1
+            db.add(MeshNode(tenant_id=tenant_id, eui=eui, kind=kind, last_seen=ts))
     db.commit()
-    return {"ok": True, "routers": seen}
+    return {"ok": True, "nodes": len(items)}
 
 
 # ---- topology sync (replaces app-local SharedPreferences) ------------------ #
