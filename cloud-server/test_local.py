@@ -48,6 +48,9 @@ with client:  # triggers lifespan (init_db + watchdog)
     check(r.status_code == 200, f"register -> {r.status_code} {r.text}")
     token = r.json()["token"]
     auth = {"Authorization": f"Bearer {token}"}
+    org_code = r.json()["org_code"]
+    tid = r.json()["tenant_id"]
+    check(len(org_code) >= 6 and r.json()["role"] == "admin", "register returns org_code + admin role")
 
     print("2) login round-trip")
     r = client.post("/v1/auth/login", json={"email": "admin@acme.test", "password": "hunter2"})
@@ -161,5 +164,52 @@ with client:  # triggers lifespan (init_db + watchdog)
                          json={"email": "x@y.z", "password": "nope"}).status_code
              for _ in range(5)]
     check(429 in codes, f"login is rate-limited past the cap ({codes})")
+    cfg.AUTH_RATE_MAX = 1000              # relax again for the rest of the suite
+    appmod._rl_hits.clear()
+
+    print("14) member join request -> admin approval -> notification opt-in")
+    from db import SessionLocal as _SL
+
+    def recipients():
+        with _SL() as s:
+            return appmod.recipients_for(s, tid)
+
+    # A member joins the admin's org by code -> pending, no notifications.
+    r = client.post("/v1/auth/join", json={
+        "org_code": org_code, "name": "Bob", "email": "bob@acme.test",
+        "phone": "+15550001111", "password": "bobpass1"})
+    check(r.status_code == 200 and r.json()["status"] == "pending", "join by code -> pending member")
+    mauth = {"Authorization": f"Bearer {r.json()['token']}"}
+    check(client.get("/v1/me", headers=mauth).json()["status"] == "pending", "member /me shows pending")
+    check(client.post("/v1/auth/join", json={"org_code": "BADCODE9", "email": "x@x.x",
+          "password": "pw"}).status_code == 404, "unknown org code rejected")
+
+    pend = client.get("/v1/members?state=pending", headers=auth).json()["members"]
+    bob = next(m for m in pend if m["email"] == "bob@acme.test")
+    check(bob["status"] == "pending", "admin sees the pending join request")
+    em, ph = recipients()
+    check("bob@acme.test" not in em and "+15550001111" not in ph, "pending member gets NO notifications")
+
+    # A non-admin cannot manage members.
+    check(client.get("/v1/members", headers=mauth).status_code == 403, "member can't list members (admin only)")
+
+    # Admin approves, then opts Bob into email, then SMS.
+    check(client.post(f"/v1/members/{bob['id']}/approve", headers=auth).status_code == 200, "admin approves member")
+    em, ph = recipients()
+    check("bob@acme.test" not in em, "approved-but-not-opted-in member still gets no email")
+    client.put(f"/v1/members/{bob['id']}/notifications", headers=auth, json={"email_enabled": True})
+    em, ph = recipients()
+    check("bob@acme.test" in em, "admin enabling email adds member to recipients")
+    client.put(f"/v1/members/{bob['id']}/notifications", headers=auth, json={"sms_enabled": True})
+    em, ph = recipients()
+    check("+15550001111" in ph, "admin enabling SMS adds member's phone to recipients")
+    client.put(f"/v1/members/{bob['id']}/notifications", headers=auth, json={"email_enabled": False, "sms_enabled": False})
+    em, ph = recipients()
+    check("bob@acme.test" not in em and "+15550001111" not in ph, "admin can revoke email + SMS")
+
+    # Rejected member can't log in.
+    check(client.post(f"/v1/members/{bob['id']}/reject", headers=auth).status_code == 200, "admin rejects member")
+    check(client.post("/v1/auth/login", json={"email": "bob@acme.test", "password": "bobpass1"}).status_code == 403,
+          "rejected member is denied login")
 
 print("\nALL CHECKS PASSED")

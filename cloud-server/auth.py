@@ -74,6 +74,16 @@ def hash_otp(code: str) -> str:
     return hashlib.sha256(code.strip().encode()).hexdigest()
 
 
+# --- Org join code ---------------------------------------------------------
+
+_ORG_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no easily-confused chars
+
+
+def generate_org_code(n: int = 8) -> str:
+    """A short shareable code members enter to request joining an org."""
+    return "".join(secrets.choice(_ORG_ALPHABET) for _ in range(n))
+
+
 # --- JWT -------------------------------------------------------------------
 
 def issue_token(user: User) -> str:

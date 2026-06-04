@@ -53,8 +53,10 @@ class Tenant(Base):
     __tablename__ = "tenants"
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     name: Mapped[str] = mapped_column(String(200))
-    # Explicit alert targets (comma-separated). If empty, alert emails fall back
-    # to all of the tenant's user emails.
+    # Short shareable code members enter to request joining this org.
+    org_code: Mapped[str] = mapped_column(String(16), default="", index=True)
+    # OPTIONAL extra external alert targets (comma-separated), in addition to the
+    # per-member opt-ins. Usually empty — recipients come from member flags.
     alert_emails: Mapped[str] = mapped_column(String(2000), default="")
     alert_phones: Mapped[str] = mapped_column(String(2000), default="")
     created_at: Mapped[float] = mapped_column(Float, default=now)
@@ -64,9 +66,17 @@ class User(Base):
     __tablename__ = "users"
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     tenant_id: Mapped[str] = mapped_column(String(32), ForeignKey("tenants.id"), index=True)
+    name: Mapped[str] = mapped_column(String(120), default="")
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    phone: Mapped[str] = mapped_column(String(32), default="")        # E.164 for SMS
     password_hash: Mapped[str] = mapped_column(String(255))
-    role: Mapped[str] = mapped_column(String(20), default="admin")  # admin|tech|viewer
+    role: Mapped[str] = mapped_column(String(20), default="member")   # admin|member
+    # Join-request lifecycle: a new registrant is 'pending' until an admin
+    # approves; only 'active' members receive notifications.
+    status: Mapped[str] = mapped_column(String(20), default="pending")  # pending|active|rejected
+    # Admin-controlled per-member notification delivery.
+    email_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    sms_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[float] = mapped_column(Float, default=now)
 
 

@@ -14,6 +14,9 @@ the dispatch surface here (notify_email / notify_sms) is where it will slot in.
 from __future__ import annotations
 
 import smtplib
+import urllib.parse
+import urllib.request
+from base64 import b64encode
 from email.message import EmailMessage
 
 import config
@@ -94,18 +97,51 @@ def notify_email(to: list[str], subject: str, body: str) -> None:
     print(f"[email:skipped] {subject} -> {recipients}\n{body}")
 
 
+def _send_sns(number: str, message: str) -> bool:
+    client = _sns_client()
+    if client is None or not config.SNS_SMS_ENABLED:
+        return False
+    try:
+        client.publish(PhoneNumber=number, Message=message)
+        print(f"[sms:sent:sns] -> {number}")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        print(f"[sms:error:sns] {number}: {exc}")
+        return False
+
+
+def _send_twilio(number: str, message: str) -> bool:
+    """Send one SMS via Twilio's REST API (stdlib only — no SDK dependency)."""
+    if not (config.TWILIO_ACCOUNT_SID and config.TWILIO_AUTH_TOKEN and config.TWILIO_FROM):
+        return False
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{config.TWILIO_ACCOUNT_SID}/Messages.json"
+    data = urllib.parse.urlencode(
+        {"From": config.TWILIO_FROM, "To": number, "Body": message}
+    ).encode()
+    auth = b64encode(
+        f"{config.TWILIO_ACCOUNT_SID}:{config.TWILIO_AUTH_TOKEN}".encode()
+    ).decode()
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Authorization", f"Basic {auth}")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            ok = 200 <= resp.status < 300
+        print(f"[sms:{'sent' if ok else 'error'}:twilio] -> {number}")
+        return ok
+    except Exception as exc:  # noqa: BLE001
+        print(f"[sms:error:twilio] {number}: {exc}")
+        return False
+
+
 def notify_sms(numbers: list[str], message: str) -> None:
-    """Best-effort SNS SMS send. Never raises into the caller."""
+    """Best-effort SMS via SNS, then Twilio, then log. Never raises."""
     nums = [n.strip() for n in numbers if n and n.strip()]
     if not nums:
         return
-    client = _sns_client()
-    if client is None or not config.SNS_SMS_ENABLED:
-        print(f"[sms:skipped] -> {nums}: {message}")
-        return
     for number in nums:
-        try:
-            client.publish(PhoneNumber=number, Message=message)
-            print(f"[sms:sent] -> {number}")
-        except Exception as exc:  # noqa: BLE001
-            print(f"[sms:error] {number}: {exc}")
+        if _send_sns(number, message):
+            continue
+        if _send_twilio(number, message):
+            continue
+        print(f"[sms:skipped] -> {number}: {message}")

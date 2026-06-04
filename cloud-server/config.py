@@ -61,6 +61,13 @@ SMTP_PASS = os.environ.get("SMTP_PASS", "")
 SMTP_STARTTLS = os.environ.get("SMTP_STARTTLS", "1") not in ("", "0", "false", "False")
 MAIL_FROM = (os.environ.get("MAIL_FROM", "") or SES_FROM or SMTP_USER or "alerts@example.com")
 
+# --- Twilio SMS (local / on-prem alternative to SNS) -----------------------
+# Set the SID/token/from-number to send real SMS without AWS. SMS delivery
+# order is: SNS (if SNS_SMS_ENABLED) -> Twilio (if SID set) -> log.
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
+TWILIO_FROM = os.environ.get("TWILIO_FROM", "")     # your Twilio number, E.164
+
 # --- Hardening -------------------------------------------------------------
 # ENV selects the startup security posture:
 #   dev (default) — no checks, frictionless local development.

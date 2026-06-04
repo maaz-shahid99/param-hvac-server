@@ -37,6 +37,7 @@ from auth import (
     Principal,
     current_principal,
     generate_api_key,
+    generate_org_code,
     generate_otp,
     get_db,
     hash_otp,
@@ -95,13 +96,22 @@ def hottest(probes: list[float | None]) -> float:
 
 
 def recipients_for(db: Session, tenant_id: str) -> tuple[list[str], list[str]]:
-    """(emails, phones) for a tenant. Explicit targets win; else all user emails."""
+    """(emails, phones) for a tenant's alerts: ACTIVE members the admin has
+    opted in, plus any extra external addresses on the tenant. Pending/rejected
+    members and opted-out members are never notified."""
+    members = db.scalars(
+        select(User).where(User.tenant_id == tenant_id, User.status == "active")
+    ).all()
+    emails = [m.email for m in members if m.email_enabled and m.email]
+    phones = [m.phone for m in members if m.sms_enabled and m.phone]
+
     t = db.get(Tenant, tenant_id)
-    emails = [e.strip() for e in (t.alert_emails or "").split(",") if e.strip()] if t else []
-    phones = [p.strip() for p in (t.alert_phones or "").split(",") if p.strip()] if t else []
-    if not emails:
-        emails = list(db.scalars(select(User.email).where(User.tenant_id == tenant_id)).all())
-    return emails, phones
+    if t:
+        emails += [e.strip() for e in (t.alert_emails or "").split(",") if e.strip()]
+        phones += [p.strip() for p in (t.alert_phones or "").split(",") if p.strip()]
+
+    # de-dupe, preserve order
+    return list(dict.fromkeys(emails)), list(dict.fromkeys(phones))
 
 
 def rebuild_sensor_map(db: Session, tenant_id: str, topo: dict) -> int:
@@ -241,7 +251,17 @@ def rate_limit(request: Request) -> None:
 class RegisterBody(BaseModel):
     bootstrap_token: str
     tenant_name: str
+    name: str = ""
     email: str
+    phone: str = ""
+    password: str
+
+
+class JoinBody(BaseModel):
+    org_code: str
+    name: str = ""
+    email: str
+    phone: str = ""
     password: str
 
 
@@ -250,21 +270,59 @@ class LoginBody(BaseModel):
     password: str
 
 
+def _auth_payload(user: User, tenant: Tenant | None = None) -> dict:
+    out = {"token": issue_token(user), "tenant_id": user.tenant_id,
+           "role": user.role, "status": user.status, "name": user.name,
+           "email": user.email, "phone": user.phone}
+    if tenant is not None:
+        out["org_code"] = tenant.org_code
+    return out
+
+
 @app.post("/v1/auth/register")
 def register(body: RegisterBody, db: Session = Depends(get_db),
              _rl: None = Depends(rate_limit)):
-    """Bootstrap a new tenant + its first admin user. Guarded by BOOTSTRAP_TOKEN."""
+    """Bootstrap a new org + its first admin (active). Guarded by BOOTSTRAP_TOKEN.
+    Returns the org_code the admin shares so members can request to join."""
     if not config.BOOTSTRAP_TOKEN or body.bootstrap_token != config.BOOTSTRAP_TOKEN:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Bad bootstrap token")
     if db.scalar(select(User).where(User.email == body.email.lower())):
         raise HTTPException(status.HTTP_409_CONFLICT, "Email already registered")
-    tenant = Tenant(id=new_id(), name=body.tenant_name)
+    # unique org code
+    code = generate_org_code()
+    while db.scalar(select(Tenant).where(Tenant.org_code == code)):
+        code = generate_org_code()
+    tenant = Tenant(id=new_id(), name=body.tenant_name, org_code=code)
     db.add(tenant)
-    user = User(id=new_id(), tenant_id=tenant.id, email=body.email.lower(),
-                password_hash=hash_password(body.password), role="admin")
+    user = User(id=new_id(), tenant_id=tenant.id, name=body.name,
+                email=body.email.lower(), phone=body.phone,
+                password_hash=hash_password(body.password),
+                role="admin", status="active", email_enabled=True, sms_enabled=bool(body.phone))
     db.add(user)
     db.commit()
-    return {"token": issue_token(user), "tenant_id": tenant.id, "role": user.role}
+    return _auth_payload(user, tenant)
+
+
+@app.post("/v1/auth/join")
+def join(body: JoinBody, db: Session = Depends(get_db),
+         _rl: None = Depends(rate_limit)):
+    """Register as a MEMBER of an existing org (by org code). The member starts
+    'pending' — an admin must approve before they receive notifications."""
+    tenant = db.scalar(select(Tenant).where(Tenant.org_code == body.org_code.strip().upper()))
+    if not tenant:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown organization code")
+    if db.scalar(select(User).where(User.email == body.email.lower())):
+        raise HTTPException(status.HTTP_409_CONFLICT, "Email already registered")
+    # A new member gets NO notifications until an admin approves them AND opts
+    # them in (admin controls who receives email / SMS).
+    user = User(id=new_id(), tenant_id=tenant.id, name=body.name,
+                email=body.email.lower(), phone=body.phone,
+                password_hash=hash_password(body.password),
+                role="member", status="pending",
+                email_enabled=False, sms_enabled=False)
+    db.add(user)
+    db.commit()
+    return _auth_payload(user, tenant)
 
 
 @app.post("/v1/auth/login")
@@ -273,7 +331,94 @@ def login(body: LoginBody, db: Session = Depends(get_db),
     user = db.scalar(select(User).where(User.email == body.email.lower()))
     if not user or not verify_password(body.password, user.password_hash):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid credentials")
-    return {"token": issue_token(user), "tenant_id": user.tenant_id, "role": user.role}
+    if user.status == "rejected":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Your join request was declined")
+    return _auth_payload(user)
+
+
+@app.get("/v1/me")
+def me(p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    """The caller's own profile — lets a pending member poll for approval."""
+    u = db.get(User, p.user_id)
+    if not u:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "User not found")
+    return {"role": u.role, "status": u.status, "name": u.name,
+            "email": u.email, "phone": u.phone,
+            "email_enabled": u.email_enabled, "sms_enabled": u.sms_enabled}
+
+
+# ---- members (admin: approve join requests + control who gets notified) ---- #
+
+def _member_dict(u: User) -> dict:
+    return {"id": u.id, "name": u.name, "email": u.email, "phone": u.phone,
+            "role": u.role, "status": u.status,
+            "email_enabled": u.email_enabled, "sms_enabled": u.sms_enabled,
+            "created_at": u.created_at}
+
+
+@app.get("/v1/members")
+def list_members(state: str = "all", p: Principal = Depends(require_admin),
+                 db: Session = Depends(get_db)):
+    """All members in the admin's org (optionally filter by ?state=pending|active)."""
+    q = select(User).where(User.tenant_id == p.tenant_id)
+    if state in ("pending", "active", "rejected"):
+        q = q.where(User.status == state)
+    rows = db.scalars(q.order_by(User.created_at.desc())).all()
+    return {"members": [_member_dict(u) for u in rows]}
+
+
+def _get_member(db: Session, p: Principal, member_id: str) -> User:
+    u = db.get(User, member_id)
+    if not u or u.tenant_id != p.tenant_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Member not found")
+    return u
+
+
+@app.post("/v1/members/{member_id}/approve")
+def approve_member(member_id: str, p: Principal = Depends(require_admin),
+                   db: Session = Depends(get_db)):
+    u = _get_member(db, p, member_id)
+    u.status = "active"
+    db.commit()
+    return {"ok": True, "member": _member_dict(u)}
+
+
+@app.post("/v1/members/{member_id}/reject")
+def reject_member(member_id: str, p: Principal = Depends(require_admin),
+                  db: Session = Depends(get_db)):
+    u = _get_member(db, p, member_id)
+    if u.id == p.user_id:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "You can't reject yourself")
+    u.status = "rejected"
+    u.email_enabled = False
+    u.sms_enabled = False
+    db.commit()
+    return {"ok": True, "member": _member_dict(u)}
+
+
+class MemberNotifyBody(BaseModel):
+    email_enabled: bool | None = None
+    sms_enabled: bool | None = None
+    role: str | None = None          # admin|member (promote/demote)
+
+
+@app.put("/v1/members/{member_id}/notifications")
+def set_member_notifications(member_id: str, body: MemberNotifyBody,
+                             p: Principal = Depends(require_admin),
+                             db: Session = Depends(get_db)):
+    """Admin toggles who receives email / SMS (and optionally promotes a member
+    to admin). Only active members can be opted in."""
+    u = _get_member(db, p, member_id)
+    if body.email_enabled is not None:
+        u.email_enabled = body.email_enabled
+    if body.sms_enabled is not None:
+        if body.sms_enabled and not u.phone:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "Member has no phone number")
+        u.sms_enabled = body.sms_enabled
+    if body.role in ("admin", "member"):
+        u.role = body.role
+    db.commit()
+    return {"ok": True, "member": _member_dict(u)}
 
 
 # ---- password reset (email OTP) -------------------------------------------- #
