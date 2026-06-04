@@ -190,8 +190,10 @@ with client:  # triggers lifespan (init_db + watchdog)
     em, ph = recipients()
     check("bob@acme.test" not in em and "+15550001111" not in ph, "pending member gets NO notifications")
 
-    # A non-admin cannot manage members.
-    check(client.get("/v1/members", headers=mauth).status_code == 403, "member can't list members (admin only)")
+    # A non-admin can VIEW the roster but cannot manage it.
+    check(client.get("/v1/members", headers=mauth).status_code == 200, "member can view the roster (read-only)")
+    check(client.post(f"/v1/members/{bob['id']}/approve", headers=mauth).status_code == 403,
+          "member can't approve (admin only)")
 
     # Admin approves, then opts Bob into email, then SMS.
     check(client.post(f"/v1/members/{bob['id']}/approve", headers=auth).status_code == 200, "admin approves member")

@@ -358,9 +358,10 @@ def _member_dict(u: User) -> dict:
 
 
 @app.get("/v1/members")
-def list_members(state: str = "all", p: Principal = Depends(require_admin),
+def list_members(state: str = "all", p: Principal = Depends(current_principal),
                  db: Session = Depends(get_db)):
-    """All members in the admin's org (optionally filter by ?state=pending|active)."""
+    """Roster for the caller's org (any signed-in member can VIEW it; approving
+    and changing notification settings stay admin-only)."""
     q = select(User).where(User.tenant_id == p.tenant_id)
     if state in ("pending", "active", "rejected"):
         q = q.where(User.status == state)
