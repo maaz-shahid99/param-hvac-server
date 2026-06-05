@@ -191,6 +191,8 @@ class CommissionedDevice(Base):
     eui: Mapped[str] = mapped_column(String(32), index=True)          # lower-case hex
     kind: Mapped[str] = mapped_column(String(16), default="sensor")   # sensor|router|gateway
     role: Mapped[str] = mapped_column(String(2), default="")          # G|R for mesh nodes
+    # Operator-assigned friendly name. "" => the app shows an EUI-derived auto-name.
+    name: Mapped[str] = mapped_column(String(120), default="")
     added_at: Mapped[float] = mapped_column(Float, default=now)
     __table_args__ = (Index("ix_commdev_tenant_eui", "tenant_id", "eui", unique=True),)
 

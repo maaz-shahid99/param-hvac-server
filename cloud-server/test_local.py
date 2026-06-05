@@ -233,6 +233,16 @@ with client:  # triggers lifespan (init_db + watchdog)
     check(len(devs) == 1 and devs[0]["eui"] == "aabbccdd00000001", "device removed by DELETE")
     # Tenant isolation: the other org sees none of Acme's roster.
     check(client.get("/v1/devices", headers=auth2).json()["devices"] == [], "other tenant sees no devices")
+    # Naming: a PUT with a name round-trips; a later empty-name PUT must NOT clear it.
+    client.put("/v1/devices", headers=auth, json={"devices": [
+        {"eui": "AABBCCDD00000001", "kind": "sensor", "role": "", "name": "Top exhaust"}]})
+    check(client.get("/v1/devices", headers=auth).json()["devices"][0].get("name") == "Top exhaust",
+          "device name round-trips")
+    client.put("/v1/devices", headers=auth, json={"devices": [
+        {"eui": "AABBCCDD00000001", "kind": "sensor", "role": "", "name": ""}]})
+    check(client.get("/v1/devices", headers=auth).json()["devices"][0].get("name") == "Top exhaust",
+          "empty-name PUT does not clear a set name")
+
     print("16) per-probe mapping: one sensor's two probes -> two exhausts, probe-mode alerting")
     r = client.post("/v1/auth/register", json={
         "bootstrap_token": "test-boot", "tenant_name": "Probe Co",

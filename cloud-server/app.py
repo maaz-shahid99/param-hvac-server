@@ -644,14 +644,15 @@ def put_topology(body: TopologyBody, p: Principal = Depends(current_principal),
 # ---- commissioned-device roster (tenant-scoped, survives phone changes) ---- #
 
 class DevicesBody(BaseModel):
-    devices: list[dict] = []   # [{"eui","kind","role"}]
+    devices: list[dict] = []   # [{"eui","kind","role","name"}]
 
 
 @app.get("/v1/devices")
 def get_devices(p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
     rows = db.scalars(
         select(CommissionedDevice).where(CommissionedDevice.tenant_id == p.tenant_id)).all()
-    return {"devices": [{"eui": r.eui, "kind": r.kind, "role": r.role} for r in rows]}
+    return {"devices": [{"eui": r.eui, "kind": r.kind, "role": r.role, "name": r.name}
+                        for r in rows]}
 
 
 @app.put("/v1/devices")
@@ -667,13 +668,16 @@ def put_devices(body: DevicesBody, p: Principal = Depends(current_principal),
             continue
         kind = str(d.get("kind", "sensor"))
         role = str(d.get("role", ""))
+        name = str(d.get("name", "")).strip()
         row = db.scalar(select(CommissionedDevice).where(
             CommissionedDevice.tenant_id == p.tenant_id, CommissionedDevice.eui == eui))
         if row:
             row.kind, row.role = kind, role
+            if name:                  # only set a name, never blank one another phone set
+                row.name = name
         else:
             db.add(CommissionedDevice(id=new_id(), tenant_id=p.tenant_id, eui=eui,
-                                      kind=kind, role=role, added_at=now()))
+                                      kind=kind, role=role, name=name, added_at=now()))
         n += 1
     db.commit()
     return {"ok": True, "count": n}
