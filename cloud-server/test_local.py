@@ -214,4 +214,24 @@ with client:  # triggers lifespan (init_db + watchdog)
     check(client.post("/v1/auth/login", json={"email": "bob@acme.test", "password": "bobpass1"}).status_code == 403,
           "rejected member is denied login")
 
+    print("15) commissioned-device roster: additive merge + delete + isolation")
+    # Phone A registers two devices.
+    client.put("/v1/devices", headers=auth, json={"devices": [
+        {"eui": "AABBCCDD00000001", "kind": "sensor", "role": ""},
+        {"eui": "58E6C5FFFE111BB0", "kind": "gateway", "role": "G"}]})
+    devs = client.get("/v1/devices", headers=auth).json()["devices"]
+    check(len(devs) == 2, "two devices registered")
+    check({d["eui"] for d in devs} == {"aabbccdd00000001", "58e6c5fffe111bb0"}, "euis lower-cased")
+    # Phone B (partial view) PUTs only ONE -> additive: must NOT wipe the other.
+    client.put("/v1/devices", headers=auth, json={"devices": [
+        {"eui": "AABBCCDD00000001", "kind": "sensor", "role": ""}]})
+    devs = client.get("/v1/devices", headers=auth).json()["devices"]
+    check(len(devs) == 2, "partial PUT does not remove the unlisted device (additive merge)")
+    # Explicit delete removes one.
+    check(client.delete("/v1/devices/58e6c5fffe111bb0", headers=auth).status_code == 200, "delete device")
+    devs = client.get("/v1/devices", headers=auth).json()["devices"]
+    check(len(devs) == 1 and devs[0]["eui"] == "aabbccdd00000001", "device removed by DELETE")
+    # Tenant isolation: the other org sees none of Acme's roster.
+    check(client.get("/v1/devices", headers=auth2).json()["devices"] == [], "other tenant sees no devices")
+
 print("\nALL CHECKS PASSED")

@@ -52,6 +52,7 @@ from auth import (
 from db import (
     Alert,
     ApiKey,
+    CommissionedDevice,
     MeshNode,
     PasswordReset,
     Reading,
@@ -614,6 +615,54 @@ def put_topology(body: TopologyBody, p: Principal = Depends(current_principal),
     db.commit()
     mapped = rebuild_sensor_map(db, p.tenant_id, body.topology)
     return {"ok": True, "mapped_sensors": mapped}
+
+
+# ---- commissioned-device roster (tenant-scoped, survives phone changes) ---- #
+
+class DevicesBody(BaseModel):
+    devices: list[dict] = []   # [{"eui","kind","role"}]
+
+
+@app.get("/v1/devices")
+def get_devices(p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    rows = db.scalars(
+        select(CommissionedDevice).where(CommissionedDevice.tenant_id == p.tenant_id)).all()
+    return {"devices": [{"eui": r.eui, "kind": r.kind, "role": r.role} for r in rows]}
+
+
+@app.put("/v1/devices")
+def put_devices(body: DevicesBody, p: Principal = Depends(current_principal),
+                db: Session = Depends(get_db)):
+    """Additive upsert (merge): adds/updates each device in the payload but never
+    removes ones not listed — so a phone with only a partial view (e.g. cloud-only,
+    no BLE) can't wipe the roster. Use DELETE to remove."""
+    n = 0
+    for d in body.devices:
+        eui = str(d.get("eui", "")).strip().lower()
+        if not eui:
+            continue
+        kind = str(d.get("kind", "sensor"))
+        role = str(d.get("role", ""))
+        row = db.scalar(select(CommissionedDevice).where(
+            CommissionedDevice.tenant_id == p.tenant_id, CommissionedDevice.eui == eui))
+        if row:
+            row.kind, row.role = kind, role
+        else:
+            db.add(CommissionedDevice(id=new_id(), tenant_id=p.tenant_id, eui=eui,
+                                      kind=kind, role=role, added_at=now()))
+        n += 1
+    db.commit()
+    return {"ok": True, "count": n}
+
+
+@app.delete("/v1/devices/{eui}")
+def delete_device(eui: str, p: Principal = Depends(current_principal),
+                  db: Session = Depends(get_db)):
+    db.execute(delete(CommissionedDevice).where(
+        CommissionedDevice.tenant_id == p.tenant_id,
+        CommissionedDevice.eui == eui.strip().lower()))
+    db.commit()
+    return {"ok": True}
 
 
 # ---- thresholds ------------------------------------------------------------ #

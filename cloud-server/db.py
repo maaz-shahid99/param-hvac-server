@@ -171,6 +171,21 @@ class MeshNode(Base):
     __table_args__ = (Index("ix_meshnode_tenant_eui", "tenant_id", "eui", unique=True),)
 
 
+class CommissionedDevice(Base):
+    """Per-tenant registry of commissioned devices (membership + type), so the
+    app's Devices list survives phone changes / reinstalls instead of living only
+    in one phone's local cache. One row per (tenant, eui). Online status is still
+    computed client-side from readings/mesh/BLE — this is just the roster."""
+    __tablename__ = "commissioned_devices"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    tenant_id: Mapped[str] = mapped_column(String(32), ForeignKey("tenants.id"), index=True)
+    eui: Mapped[str] = mapped_column(String(32), index=True)          # lower-case hex
+    kind: Mapped[str] = mapped_column(String(16), default="sensor")   # sensor|router|gateway
+    role: Mapped[str] = mapped_column(String(2), default="")          # G|R for mesh nodes
+    added_at: Mapped[float] = mapped_column(Float, default=now)
+    __table_args__ = (Index("ix_commdev_tenant_eui", "tenant_id", "eui", unique=True),)
+
+
 class Alert(Base):
     """An open or historical alert. One open alert per (tenant, eui, kind)."""
     __tablename__ = "alerts"
