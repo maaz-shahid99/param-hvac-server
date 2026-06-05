@@ -75,27 +75,43 @@ from thresholds import _clear_alert, evaluate_reading
 # Helpers                                                                      #
 # --------------------------------------------------------------------------- #
 
-def parse_probe_csv(data: str) -> list[float | None]:
-    """'t=23.1,24.0,err' (or a bare CSV) -> [23.1, 24.0, None]."""
+def parse_probe_csv(data: str) -> list[dict]:
+    """Parse the gateway's probe CSV into ROM-tagged readings.
+
+    ROM form (firmware >= probe-id):   't=<rom>:23.1,<rom>:err'
+    Legacy form (position only):       't=23.1,24.0,err'  -> synth roms idx0,idx1
+
+    -> [{"rom": "28ff..", "c": 23.1}, {"rom": "idx1", "c": None}, ...]
+    The synthesized roms keep the whole pipeline working with un-upgraded SEDs;
+    once the SED reports real ROMs the mapping becomes plug/unplug-stable.
+    """
     if "=" in data:
         data = data.split("=", 1)[1]
-    out: list[float | None] = []
+    out: list[dict] = []
+    idx = 0
     for tok in data.split(","):
         tok = tok.strip()
         if not tok:
             continue
-        if tok.lower() == "err":
-            out.append(None)
-        else:
+        rom, val = "", tok
+        if ":" in tok:
+            rom, val = tok.split(":", 1)
+            rom, val = rom.strip().lower(), val.strip()
+        if not rom:
+            rom = f"idx{idx}"
+        c: float | None = None
+        if val.lower() != "err":
             try:
-                out.append(float(tok))
+                c = float(val)
             except ValueError:
-                out.append(None)
+                c = None
+        out.append({"rom": rom, "c": c})
+        idx += 1
     return out
 
 
-def hottest(probes: list[float | None]) -> float:
-    vals = [p for p in probes if isinstance(p, (int, float))]
+def hottest(probes: list[dict]) -> float:
+    vals = [p["c"] for p in probes if isinstance(p.get("c"), (int, float))]
     return max(vals) if vals else 0.0
 
 
@@ -123,6 +139,7 @@ def rebuild_sensor_map(db: Session, tenant_id: str, topo: dict) -> int:
     ingest hot path is one indexed lookup. Rebuilt wholesale on each save."""
     db.execute(delete(SensorMap).where(SensorMap.tenant_id == tenant_id))
     count = 0
+    seen: set[tuple[str, str]] = set()   # (eui, probe_rom) — one physical probe per row
     for rack in topo.get("racks", []):
         r_name = rack.get("name", "")
         for unit in rack.get("units", []):
@@ -131,10 +148,14 @@ def rebuild_sensor_map(db: Session, tenant_id: str, topo: dict) -> int:
                 eui = (port.get("assignedEui") or "").strip().lower()
                 if not eui:
                     continue
+                probe_rom = (port.get("assignedProbeRom") or "").strip().lower()
+                if (eui, probe_rom) in seen:
+                    continue   # defensive: the app enforces one place per probe
+                seen.add((eui, probe_rom))
                 slot = "B" if port.get("type") == "exhaust" else "A"
                 label = " / ".join(p for p in (r_name, u_name, port.get("label", "")) if p)
                 db.add(SensorMap(
-                    id=new_id(), tenant_id=tenant_id, eui=eui,
+                    id=new_id(), tenant_id=tenant_id, eui=eui, probe_rom=probe_rom,
                     box=int(port.get("box", 0) or 0), slot=slot, label=label,
                     rack_id=str(rack.get("id", "")), unit_id=str(unit.get("id", "")),
                     port_id=str(port.get("id", "")),
@@ -523,7 +544,7 @@ def list_api_keys(p: Principal = Depends(current_principal), db: Session = Depen
 class IngestBody(BaseModel):
     sensor_id: str                                   # EUI-64 hex
     probes: list[float | None] = Field(default_factory=list)
-    data: str | None = None                          # raw "t=23.1,24.0,err" form
+    data: str | None = None                          # raw "t=<rom>:23.1,..." form
     ts: float | None = None
 
 
@@ -531,13 +552,16 @@ class IngestBody(BaseModel):
 def ingest(body: IngestBody, tenant_id: str = Depends(tenant_from_api_key),
            db: Session = Depends(get_db)):
     """Gateway posts a reading. Authenticated by X-API-Key -> tenant."""
-    probes = body.probes
-    if not probes and body.data:
-        probes = parse_probe_csv(body.data)
+    if body.data:
+        probes = parse_probe_csv(body.data)                       # [{"rom","c"}]
+    else:   # rare: a client that posts bare floats -> synth position roms
+        probes = [{"rom": f"idx{i}", "c": v} for i, v in enumerate(body.probes)]
     eui = body.sensor_id.strip().lower()
     ts = body.ts or now()
     mx = hottest(probes)
 
+    # box/slot on the Reading is best-effort metadata; the per-probe location now
+    # comes from SensorMap at read/eval time. Use any mapped row for it.
     sm = db.scalar(select(SensorMap).where(SensorMap.tenant_id == tenant_id, SensorMap.eui == eui))
     db.add(Reading(
         tenant_id=tenant_id, ts=ts, eui=eui,
@@ -548,7 +572,7 @@ def ingest(body: IngestBody, tenant_id: str = Depends(tenant_from_api_key),
 
     # A fresh reading clears any open "stale" alert for this sensor.
     _clear_alert(db, tenant_id, eui, "stale")
-    evaluate_reading(db, tenant_id, eui, mx, recipients_for(db, tenant_id))
+    evaluate_reading(db, tenant_id, eui, probes, mx, recipients_for(db, tenant_id))
     return {"ok": True, "eui": eui, "max_c": mx}
 
 
@@ -708,17 +732,52 @@ def put_threshold(body: ThresholdBody, p: Principal = Depends(require_admin),
 
 @app.get("/v1/current")
 def current(p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
-    """Latest reading per sensor for the tenant (for the app's status view)."""
+    """Latest reading per sensor, expanded to one row per mapped probe (for the
+    app's status view). Each row carries the probe's own temperature + location;
+    an unmapped sensor yields a single row at its hottest probe so it's still
+    visible and assignable."""
     euis = db.scalars(select(Reading.eui).where(Reading.tenant_id == p.tenant_id).distinct()).all()
     out = []
     for eui in euis:
         r = db.scalar(select(Reading).where(Reading.tenant_id == p.tenant_id, Reading.eui == eui)
                       .order_by(Reading.ts.desc()).limit(1))
-        sm = db.scalar(select(SensorMap).where(SensorMap.tenant_id == p.tenant_id, SensorMap.eui == eui))
-        out.append({"eui": eui, "ts": r.ts, "max_c": r.max_c,
-                    "probes": json.loads(r.probes),
-                    "location": (sm.label if sm else ""), "box": r.box, "slot": r.slot})
+        probes = json.loads(r.probes)                          # [{"rom","c"}] (or legacy [float])
+        temp_by_rom = {pr["rom"]: pr["c"] for pr in probes if isinstance(pr, dict)}
+        sms = db.scalars(select(SensorMap).where(
+            SensorMap.tenant_id == p.tenant_id, SensorMap.eui == eui)).all()
+        if not sms:
+            out.append({"eui": eui, "rom": "", "ts": r.ts, "temp": r.max_c, "max_c": r.max_c,
+                        "probes": probes, "location": "", "box": r.box, "slot": r.slot})
+            continue
+        for sm in sms:
+            temp = temp_by_rom.get(sm.probe_rom) if sm.probe_rom else r.max_c
+            out.append({"eui": eui, "rom": sm.probe_rom, "ts": r.ts, "temp": temp,
+                        "max_c": r.max_c, "location": sm.label, "box": sm.box, "slot": sm.slot})
     return {"sensors": out}
+
+
+# ---- tenant settings (alert granularity) ----------------------------------- #
+
+class SettingsBody(BaseModel):
+    alert_granularity: str = "sensor"   # sensor|probe
+
+
+@app.get("/v1/settings")
+def get_settings(p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    t = db.get(Tenant, p.tenant_id)
+    return {"alert_granularity": (t.alert_granularity if t else "sensor")}
+
+
+@app.put("/v1/settings")
+def put_settings(body: SettingsBody, p: Principal = Depends(require_admin),
+                 db: Session = Depends(get_db)):
+    if body.alert_granularity not in ("sensor", "probe"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "alert_granularity must be sensor|probe")
+    t = db.get(Tenant, p.tenant_id)
+    if t:
+        t.alert_granularity = body.alert_granularity
+        db.commit()
+    return {"ok": True, "alert_granularity": body.alert_granularity}
 
 
 @app.get("/v1/routers")

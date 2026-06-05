@@ -55,6 +55,10 @@ class Tenant(Base):
     name: Mapped[str] = mapped_column(String(200))
     # Short shareable code members enter to request joining this org.
     org_code: Mapped[str] = mapped_column(String(16), default="", index=True)
+    # Alert granularity: 'sensor' = one alert per sensor on its hottest probe
+    # (legacy); 'probe' = each mapped probe alerts independently at its own
+    # exhaust. Operator-selectable; default preserves the original behavior.
+    alert_granularity: Mapped[str] = mapped_column(String(10), default="sensor")
     # OPTIONAL extra external alert targets (comma-separated), in addition to the
     # per-member opt-ins. Usually empty — recipients come from member flags.
     alert_emails: Mapped[str] = mapped_column(String(2000), default="")
@@ -116,19 +120,24 @@ class Topology(Base):
 
 
 class SensorMap(Base):
-    """Flattened EUI -> physical location, derived from the topology on save so
-    the ingest hot path is a single indexed lookup (no JSON parsing per reading)."""
+    """Flattened (EUI, probe) -> physical location, derived from the topology on
+    save so the ingest hot path is a single indexed lookup (no JSON parsing per
+    reading). One sensor's probes can fan out to many ports, so the row is keyed
+    by (eui, probe_rom): a given physical probe lives in exactly one port."""
     __tablename__ = "sensor_map"
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     tenant_id: Mapped[str] = mapped_column(String(32), ForeignKey("tenants.id"), index=True)
     eui: Mapped[str] = mapped_column(String(32), index=True)         # lower-case hex
+    # DS18B20 ROM (64-bit serial, 16-hex) of the probe wired to this port. "" =
+    # whole-sensor legacy mapping (alerts/displays on the sensor's hottest probe).
+    probe_rom: Mapped[str] = mapped_column(String(32), default="", index=True)
     box: Mapped[int] = mapped_column(Integer, default=0)
     slot: Mapped[str] = mapped_column(String(2), default="A")        # A=intake, B=exhaust
     label: Mapped[str] = mapped_column(String(300), default="")      # "Rack / Unit / Port"
     rack_id: Mapped[str] = mapped_column(String(64), default="")
     unit_id: Mapped[str] = mapped_column(String(64), default="")     # for intake/exhaust ΔT pairing
     port_id: Mapped[str] = mapped_column(String(64), default="")
-    __table_args__ = (Index("ix_sensormap_tenant_eui", "tenant_id", "eui", unique=True),)
+    __table_args__ = (Index("ix_sensormap_tenant_eui_probe", "tenant_id", "eui", "probe_rom", unique=True),)
 
 
 class Threshold(Base):
@@ -153,7 +162,7 @@ class Reading(Base):
     eui: Mapped[str] = mapped_column(String(32), index=True)
     box: Mapped[int] = mapped_column(Integer, default=0)
     slot: Mapped[str] = mapped_column(String(2), default="A")
-    probes: Mapped[str] = mapped_column(Text, default="[]")   # JSON list of float|null
+    probes: Mapped[str] = mapped_column(Text, default="[]")   # JSON list of {"rom": str, "c": float|null}
     max_c: Mapped[float] = mapped_column(Float, default=0.0)  # hottest valid probe
     __table_args__ = (Index("ix_reading_tenant_ts", "tenant_id", "ts"),)
 

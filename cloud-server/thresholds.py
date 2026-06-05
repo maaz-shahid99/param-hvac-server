@@ -19,11 +19,13 @@ sensors that stop reporting — a dead sensor is as dangerous as a hot one.
 
 from __future__ import annotations
 
+import json
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 import config
-from db import Alert, Reading, SensorMap, Threshold, now
+from db import Alert, Reading, SensorMap, Tenant, Threshold, now
 from notifications import notify_email, notify_sms
 
 
@@ -129,27 +131,86 @@ def _latest_max(db: Session, tenant_id: str, eui: str) -> float | None:
     return r.max_c if r else None
 
 
-def evaluate_reading(db: Session, tenant_id: str, eui: str, max_c: float,
-                     recipients) -> None:
-    """Run high-temp and ΔT checks for a freshly-stored reading."""
-    sm = db.scalar(
-        select(SensorMap).where(SensorMap.tenant_id == tenant_id, SensorMap.eui == eui)
+def _latest_probe_temp(db: Session, tenant_id: str, eui: str, rom: str) -> float | None:
+    """Latest temperature of one specific probe (by ROM) of a sensor."""
+    r = db.scalar(
+        select(Reading).where(Reading.tenant_id == tenant_id, Reading.eui == eui)
+        .order_by(Reading.ts.desc()).limit(1)
     )
+    if not r:
+        return None
+    try:
+        for p in json.loads(r.probes):
+            if isinstance(p, dict) and p.get("rom") == rom:
+                return p.get("c")
+    except (ValueError, TypeError):
+        pass
+    return None
+
+
+def _member_temp(db: Session, tenant_id: str, m: SensorMap) -> float | None:
+    """A unit member's temperature for ΔT: its specific probe if mapped per-probe,
+    else the sensor's hottest probe (legacy whole-sensor mapping)."""
+    if m.probe_rom:
+        return _latest_probe_temp(db, tenant_id, m.eui, m.probe_rom)
+    return _latest_max(db, tenant_id, m.eui)
+
+
+def evaluate_reading(db: Session, tenant_id: str, eui: str, probes: list[dict],
+                     max_c: float, recipients) -> None:
+    """Run high-temp and ΔT checks for a freshly-stored reading, honoring the
+    tenant's alert granularity:
+      - 'sensor' (default): one high_temp alert per sensor on its hottest probe.
+      - 'probe': each mapped probe alerts independently at its own exhaust, keyed
+        '<eui>:<rom>'.
+    `probes` is the parsed [{"rom","c"}] list for this reading."""
+    granularity = _granularity(db, tenant_id)
+    sms = db.scalars(
+        select(SensorMap).where(SensorMap.tenant_id == tenant_id, SensorMap.eui == eui)
+    ).all()
+
+    if granularity == "probe":
+        temp_by_rom = {p["rom"]: p["c"] for p in probes if isinstance(p, dict)}
+        units: set[str] = set()
+        for sm in sms:
+            val = temp_by_rom.get(sm.probe_rom) if sm.probe_rom else max_c
+            if val is None:
+                continue
+            high_c, _delta_c, enabled = resolve_threshold(db, tenant_id, sm)
+            if not enabled:
+                continue
+            key = f"{eui}:{sm.probe_rom}" if sm.probe_rom else eui
+            location = sm.label or f"sensor {eui}"
+            if val >= high_c:
+                _open_alert(db, tenant_id, recipients, key, "high_temp", location, val, high_c)
+            elif val <= high_c - config.HYSTERESIS_C:
+                _clear_alert(db, tenant_id, key, "high_temp")
+            if sm.unit_id:
+                units.add(sm.unit_id)
+        for unit_id in units:
+            member = next((m for m in sms if m.unit_id == unit_id), None)
+            _, delta_c, enabled = resolve_threshold(db, tenant_id, member)
+            if enabled:
+                _evaluate_delta(db, tenant_id, unit_id, delta_c, recipients)
+        return
+
+    # --- sensor mode (legacy): hottest probe, one alert per sensor ---
+    sm = sms[0] if sms else None
     high_c, delta_c, enabled = resolve_threshold(db, tenant_id, sm)
     if not enabled:
         return
-
     location = sm.label if (sm and sm.label) else f"sensor {eui}"
-
-    # --- high temperature ---
     if max_c >= high_c:
         _open_alert(db, tenant_id, recipients, eui, "high_temp", location, max_c, high_c)
     elif max_c <= high_c - config.HYSTERESIS_C:
         _clear_alert(db, tenant_id, eui, "high_temp")
-
-    # --- delta (exhaust - intake) per unit ---
     if sm and sm.unit_id:
         _evaluate_delta(db, tenant_id, sm.unit_id, delta_c, recipients)
+
+
+def _granularity(db: Session, tenant_id: str) -> str:
+    t = db.get(Tenant, tenant_id)
+    return t.alert_granularity if t else "sensor"
 
 
 def _evaluate_delta(db: Session, tenant_id: str, unit_id: str,
@@ -162,8 +223,8 @@ def _evaluate_delta(db: Session, tenant_id: str, unit_id: str,
     if not intake or not exhaust:
         return  # need both sides to compute a delta
 
-    intake_t = _hottest([_latest_max(db, tenant_id, m.eui) for m in intake])
-    exhaust_t = _hottest([_latest_max(db, tenant_id, m.eui) for m in exhaust])
+    intake_t = _hottest([_member_temp(db, tenant_id, m) for m in intake])
+    exhaust_t = _hottest([_member_temp(db, tenant_id, m) for m in exhaust])
     if intake_t is None or exhaust_t is None:
         return
 

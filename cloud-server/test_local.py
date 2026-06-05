@@ -233,5 +233,44 @@ with client:  # triggers lifespan (init_db + watchdog)
     check(len(devs) == 1 and devs[0]["eui"] == "aabbccdd00000001", "device removed by DELETE")
     # Tenant isolation: the other org sees none of Acme's roster.
     check(client.get("/v1/devices", headers=auth2).json()["devices"] == [], "other tenant sees no devices")
+    print("16) per-probe mapping: one sensor's two probes -> two exhausts, probe-mode alerting")
+    r = client.post("/v1/auth/register", json={
+        "bootstrap_token": "test-boot", "tenant_name": "Probe Co",
+        "email": "admin@probe.test", "password": "hunter2"})
+    pauth = {"Authorization": f"Bearer {r.json()['token']}"}
+    pkey = client.post("/v1/apikeys", headers=pauth, json={"label": "rig"}).json()["api_key"]
+    # One C6 (EUI) whose two DS18B20 probes (by ROM) feed two different exhausts.
+    eui = "ee0000000000aaaa"
+    ptopo = {"racks": [{"id": "r1", "name": "Rack Z", "units": [
+        {"id": "u1", "name": "Unit 1", "ports": [
+            {"id": "p1", "type": "exhaust", "label": "Exhaust 1", "box": 1,
+             "assignedEui": eui, "assignedProbeRom": "28ff01"},
+        ]},
+        {"id": "u2", "name": "Unit 2", "ports": [
+            {"id": "p2", "type": "exhaust", "label": "Exhaust 2", "box": 2,
+             "assignedEui": eui, "assignedProbeRom": "28ff02"},
+        ]},
+    ]}]}
+    r = client.put("/v1/topology", headers=pauth, json={"topology": ptopo})
+    check(r.json()["mapped_sensors"] == 2, "one sensor's 2 probes mapped to 2 ports")
+    client.put("/v1/thresholds", headers=pauth, json={"scope": "tenant", "high_c": 40, "delta_c": 99})
+    check(client.put("/v1/settings", headers=pauth, json={"alert_granularity": "probe"}).status_code == 200,
+          "alert granularity set to probe")
+    # probe 28ff01 is hot (55), 28ff02 is cool (20) -> exactly ONE high_temp alert.
+    client.post("/v1/readings", headers={"X-API-Key": pkey},
+                json={"sensor_id": eui.upper(), "data": "t=28ff01:55.0,28ff02:20.0"})
+    palerts = client.get("/v1/alerts?state=open", headers=pauth).json()["alerts"]
+    phigh = [a for a in palerts if a["kind"] == "high_temp"]
+    check(len(phigh) == 1, "exactly one probe alerts (only the hot exhaust)")
+    check(phigh[0]["location"] == "Rack Z / Unit 1 / Exhaust 1", "alert names the hot probe's own exhaust")
+    cur = client.get("/v1/current", headers=pauth).json()["sensors"]
+    temps = sorted(s["temp"] for s in cur)
+    check(len(cur) == 2 and temps == [20.0, 55.0], "current shows each probe's own temp at its exhaust")
+    # Cooling the hot probe clears its alert independently.
+    client.post("/v1/readings", headers={"X-API-Key": pkey},
+                json={"sensor_id": eui, "data": "t=28ff01:25.0,28ff02:20.0"})
+    open_high = [a for a in client.get("/v1/alerts?state=open", headers=pauth).json()["alerts"]
+                 if a["kind"] == "high_temp"]
+    check(not open_high, "probe alert clears when that probe cools")
 
 print("\nALL CHECKS PASSED")
