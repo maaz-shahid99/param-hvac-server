@@ -25,8 +25,9 @@ import time
 import uuid
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -53,6 +54,8 @@ from db import (
     Alert,
     ApiKey,
     CommissionedDevice,
+    CrashReport,
+    EnvReading,
     MeshNode,
     PasswordReset,
     Reading,
@@ -75,6 +78,38 @@ from thresholds import _clear_alert, evaluate_reading
 # Helpers                                                                      #
 # --------------------------------------------------------------------------- #
 
+# Ingest safety limits — reject/normalize untrusted gateway input so a parse
+# glitch or rogue device can't poison the DB or false-trigger alerts.
+MAX_PROBES = 16                       # a DS18B20 bus realistically carries <= ~10
+MAX_DATA_LEN = 512                    # cap the raw CSV; longer => garbage/abuse
+TEMP_MIN_C, TEMP_MAX_C = -55.0, 125.0  # DS18B20 operating range
+_ROM_HEX = set("0123456789abcdef")
+
+
+def clean_temp(c: float | None) -> float | None:
+    """Out-of-range or non-finite readings are treated as 'err' (None) so absurd
+    values never get stored or evaluated against thresholds."""
+    if c is None:
+        return None
+    try:
+        c = float(c)
+    except (TypeError, ValueError):
+        return None
+    if c != c or c in (float("inf"), float("-inf")):   # NaN / inf
+        return None
+    return c if TEMP_MIN_C <= c <= TEMP_MAX_C else None
+
+
+def clean_rom(rom: str, idx: int) -> str:
+    """Normalize a probe ROM: keep a synth 'idxN', else strip to hex and cap
+    length. Anything non-hex/empty falls back to the positional 'idxN'."""
+    rom = (rom or "").strip().lower()
+    if rom.startswith("idx"):
+        return rom[:8]
+    rom = "".join(ch for ch in rom if ch in _ROM_HEX)
+    return rom[:16] if rom else f"idx{idx}"
+
+
 def parse_probe_csv(data: str) -> list[dict]:
     """Parse the gateway's probe CSV into ROM-tagged readings.
 
@@ -84,28 +119,31 @@ def parse_probe_csv(data: str) -> list[dict]:
     -> [{"rom": "28ff..", "c": 23.1}, {"rom": "idx1", "c": None}, ...]
     The synthesized roms keep the whole pipeline working with un-upgraded SEDs;
     once the SED reports real ROMs the mapping becomes plug/unplug-stable.
+    Input is untrusted: the payload is length-capped, probe count is capped, ROMs
+    are sanitized, and temps outside the DS18B20 range are dropped to 'err'.
     """
+    data = (data or "")[:MAX_DATA_LEN]
     if "=" in data:
         data = data.split("=", 1)[1]
     out: list[dict] = []
     idx = 0
     for tok in data.split(","):
+        if len(out) >= MAX_PROBES:
+            break
         tok = tok.strip()
         if not tok:
             continue
         rom, val = "", tok
         if ":" in tok:
             rom, val = tok.split(":", 1)
-            rom, val = rom.strip().lower(), val.strip()
-        if not rom:
-            rom = f"idx{idx}"
+            val = val.strip()
         c: float | None = None
         if val.lower() != "err":
             try:
                 c = float(val)
             except ValueError:
                 c = None
-        out.append({"rom": rom, "c": c})
+        out.append({"rom": clean_rom(rom, idx), "c": clean_temp(c)})
         idx += 1
     return out
 
@@ -113,6 +151,13 @@ def parse_probe_csv(data: str) -> list[dict]:
 def hottest(probes: list[dict]) -> float:
     vals = [p["c"] for p in probes if isinstance(p.get("c"), (int, float))]
     return max(vals) if vals else 0.0
+
+
+def valid_eui(eui: str) -> bool:
+    """A device EUI is exactly 16 lower-hex chars. Guards against a gateway
+    parse-glitch (e.g. a mangled sensor_id that swallowed a log line) creating
+    phantom 'devices' in the roster / readings."""
+    return len(eui) == 16 and all(c in "0123456789abcdef" for c in eui)
 
 
 def recipients_for(db: Session, tenant_id: str) -> tuple[list[str], list[str]]:
@@ -555,8 +600,13 @@ def ingest(body: IngestBody, tenant_id: str = Depends(tenant_from_api_key),
     if body.data:
         probes = parse_probe_csv(body.data)                       # [{"rom","c"}]
     else:   # rare: a client that posts bare floats -> synth position roms
-        probes = [{"rom": f"idx{i}", "c": v} for i, v in enumerate(body.probes)]
+        probes = [{"rom": f"idx{i}", "c": clean_temp(v)}
+                  for i, v in enumerate(body.probes[:MAX_PROBES])]
     eui = body.sensor_id.strip().lower()
+    if not valid_eui(eui):
+        # drop a malformed reading rather than create a phantom sensor (200 so the
+        # gateway doesn't retry-spam).
+        return {"ok": False, "error": "invalid sensor_id", "eui": eui}
     ts = body.ts or now()
     mx = hottest(probes)
 
@@ -664,8 +714,8 @@ def put_devices(body: DevicesBody, p: Principal = Depends(current_principal),
     n = 0
     for d in body.devices:
         eui = str(d.get("eui", "")).strip().lower()
-        if not eui:
-            continue
+        if not valid_eui(eui):
+            continue   # never store a malformed EUI in the roster
         kind = str(d.get("kind", "sensor"))
         role = str(d.get("role", ""))
         name = str(d.get("name", "")).strip()
@@ -763,13 +813,17 @@ def current(p: Principal = Depends(current_principal), db: Session = Depends(get
 # ---- tenant settings (alert granularity) ----------------------------------- #
 
 class SettingsBody(BaseModel):
-    alert_granularity: str = "sensor"   # sensor|probe
+    alert_granularity: str = "sensor"        # sensor|probe
+    collect_interval_s: int | None = None    # how often devices sample/forward (s)
 
 
 @app.get("/v1/settings")
 def get_settings(p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
     t = db.get(Tenant, p.tenant_id)
-    return {"alert_granularity": (t.alert_granularity if t else "sensor")}
+    return {
+        "alert_granularity": (t.alert_granularity if t else "sensor"),
+        "collect_interval_s": (t.collect_interval_s if t else 60),
+    }
 
 
 @app.put("/v1/settings")
@@ -780,8 +834,208 @@ def put_settings(body: SettingsBody, p: Principal = Depends(require_admin),
     t = db.get(Tenant, p.tenant_id)
     if t:
         t.alert_granularity = body.alert_granularity
+        if body.collect_interval_s is not None:
+            t.collect_interval_s = max(10, min(3600, int(body.collect_interval_s)))
         db.commit()
-    return {"ok": True, "alert_granularity": body.alert_granularity}
+    return {"ok": True, "alert_granularity": t.alert_granularity if t else body.alert_granularity,
+            "collect_interval_s": t.collect_interval_s if t else 60}
+
+
+# ---- environmental data (router/gateway BME) + CSV export ------------------ #
+
+def _num(v) -> float:
+    try:
+        return float(v) if v is not None else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _iso(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+def _csv(s: str) -> str:
+    """Minimal CSV field quoting."""
+    s = str(s)
+    if any(c in s for c in (",", '"', "\n", "\r")):
+        return '"' + s.replace('"', '""') + '"'
+    return s
+
+
+def _device_names(db: Session, tenant_id: str) -> dict:
+    return {d.eui: d.name for d in db.scalars(
+        select(CommissionedDevice).where(CommissionedDevice.tenant_id == tenant_id)).all()}
+
+
+class EnvBody(BaseModel):
+    sensor_id: str                       # the router/gateway EUI
+    temp: float | None = None
+    hum: float | None = None
+    pres: float | None = None
+    voc: float | None = None
+    ts: float | None = None
+
+
+@app.post("/v1/env")
+def ingest_env(body: EnvBody, tenant_id: str = Depends(tenant_from_api_key),
+               db: Session = Depends(get_db)):
+    """A router/gateway posts a BME environmental sample (via the gateway's key)."""
+    eui = body.sensor_id.strip().lower()
+    if not valid_eui(eui):
+        return {"ok": False, "error": "invalid sensor_id", "eui": eui}
+    db.add(EnvReading(tenant_id=tenant_id, ts=(body.ts or now()), eui=eui,
+                      temp=_num(body.temp), hum=_num(body.hum),
+                      pres=_num(body.pres), voc=_num(body.voc)))
+    db.commit()
+    return {"ok": True, "eui": eui}
+
+
+@app.get("/v1/env/current")
+def env_current(p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    """Latest BME sample per router/gateway, for the app/web env tab."""
+    names = _device_names(db, p.tenant_id)
+    euis = db.scalars(select(EnvReading.eui).where(
+        EnvReading.tenant_id == p.tenant_id).distinct()).all()
+    out = []
+    for eui in euis:
+        r = db.scalar(select(EnvReading).where(
+            EnvReading.tenant_id == p.tenant_id, EnvReading.eui == eui)
+            .order_by(EnvReading.ts.desc()).limit(1))
+        out.append({"eui": eui, "name": names.get(eui, ""), "ts": r.ts,
+                    "temp": r.temp, "hum": r.hum, "pres": r.pres, "voc": r.voc})
+    return {"env": out}
+
+
+@app.get("/v1/env/probes")
+def env_probes(p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    """Every probe of every COMMISSIONED/mapped sensor's latest reading — for the
+    Environment & Logs view. Each probe carries its temp + a label (its mapped
+    location, or 'Probe N' if that probe isn't assigned). Sensors with no mapping
+    at all are excluded (no bare raw-EUI rows)."""
+    names = _device_names(db, p.tenant_id)
+    mapped_euis = set(db.scalars(select(SensorMap.eui).where(
+        SensorMap.tenant_id == p.tenant_id).distinct()).all())
+    out = []
+    for eui in mapped_euis:
+        r = db.scalar(select(Reading).where(
+            Reading.tenant_id == p.tenant_id, Reading.eui == eui)
+            .order_by(Reading.ts.desc()).limit(1))
+        if not r:
+            continue
+        try:
+            probes = json.loads(r.probes)
+        except (ValueError, TypeError):
+            probes = []
+        loc_by_rom = {sm.probe_rom: sm.label for sm in db.scalars(select(SensorMap).where(
+            SensorMap.tenant_id == p.tenant_id, SensorMap.eui == eui)).all()}
+        for i, pr in enumerate(probes):
+            if not isinstance(pr, dict):
+                continue
+            rom = pr.get("rom", "")
+            loc = loc_by_rom.get(rom, "")
+            label = loc if loc else f"Probe {i + 1}" + (f" · …{rom[-4:]}" if rom else "")
+            out.append({"eui": eui, "name": names.get(eui, ""), "rom": rom,
+                        "temp": pr.get("c"), "location": loc, "label": label, "ts": r.ts})
+    return {"probes": out}
+
+
+@app.get("/v1/env/export.csv")
+def env_export(p: Principal = Depends(current_principal), db: Session = Depends(get_db),
+               start: float | None = None, end: float | None = None):
+    """All router BME samples as CSV (one row per sample), with device names."""
+    names = _device_names(db, p.tenant_id)
+    q = select(EnvReading).where(EnvReading.tenant_id == p.tenant_id)
+    if start is not None:
+        q = q.where(EnvReading.ts >= start)
+    if end is not None:
+        q = q.where(EnvReading.ts <= end)
+    rows = db.scalars(q.order_by(EnvReading.ts.asc())).all()
+    lines = ["timestamp,device,eui,temp_c,humidity_pct,pressure_hpa,voc\n"]
+    for r in rows:
+        name = names.get(r.eui) or r.eui
+        lines.append(f"{_iso(r.ts)},{_csv(name)},{r.eui},"
+                     f"{r.temp:.2f},{r.hum:.2f},{r.pres:.2f},{r.voc:.2f}\n")
+    return Response("".join(lines), media_type="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=routers_env.csv"})
+
+
+@app.get("/v1/readings/export.csv")
+def readings_export(p: Principal = Depends(current_principal), db: Session = Depends(get_db),
+                    start: float | None = None, end: float | None = None):
+    """All sensor (DS18B20) readings as CSV, one row per probe, with names."""
+    names = _device_names(db, p.tenant_id)
+    q = select(Reading).where(Reading.tenant_id == p.tenant_id)
+    if start is not None:
+        q = q.where(Reading.ts >= start)
+    if end is not None:
+        q = q.where(Reading.ts <= end)
+    rows = db.scalars(q.order_by(Reading.ts.asc())).all()
+    lines = ["timestamp,device,eui,probe_rom,temp_c,max_c\n"]
+    for r in rows:
+        name = names.get(r.eui) or r.eui
+        iso = _iso(r.ts)
+        try:
+            probes = json.loads(r.probes)
+        except (ValueError, TypeError):
+            probes = []
+        for pr in probes:
+            if not isinstance(pr, dict):
+                continue
+            c = pr.get("c")
+            lines.append(f"{iso},{_csv(name)},{r.eui},{pr.get('rom','')},"
+                         f"{'' if c is None else f'{float(c):.2f}'},{r.max_c:.2f}\n")
+    return Response("".join(lines), media_type="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=sensors.csv"})
+
+
+# ---- firmware crash reports ------------------------------------------------ #
+
+class CrashBody(BaseModel):
+    sensor_id: str               # the crashing device's EUI
+    reset_reason: str = ""
+    fw: str = ""
+    pc: str = ""
+    backtrace: str = ""
+    detail: str = ""
+    ts: float | None = None
+
+
+@app.post("/v1/crashes")
+def ingest_crash(body: CrashBody, tenant_id: str = Depends(tenant_from_api_key),
+                 db: Session = Depends(get_db)):
+    """A device forwards a firmware panic report (gateway directly; routers relay
+    via the gateway). Authenticated by the gateway's X-API-Key."""
+    eui = body.sensor_id.strip().lower()
+    if not valid_eui(eui):
+        return {"ok": False, "error": "invalid sensor_id", "eui": eui}
+    db.add(CrashReport(id=new_id(), tenant_id=tenant_id, eui=eui, ts=(body.ts or now()),
+                       reset_reason=body.reset_reason[:40], fw=body.fw[:40], pc=body.pc[:20],
+                       backtrace=body.backtrace[:4000], detail=body.detail[:8000]))
+    db.commit()
+    return {"ok": True, "eui": eui}
+
+
+@app.get("/v1/crashes")
+def list_crashes(p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    rows = db.scalars(select(CrashReport).where(CrashReport.tenant_id == p.tenant_id)
+                      .order_by(CrashReport.ts.desc()).limit(500)).all()
+    return {"crashes": [{"id": c.id, "eui": c.eui, "ts": c.ts, "reset_reason": c.reset_reason,
+                         "fw": c.fw, "pc": c.pc, "backtrace": c.backtrace, "detail": c.detail}
+                        for c in rows]}
+
+
+@app.get("/v1/crashes/export.csv")
+def crashes_export(p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    names = _device_names(db, p.tenant_id)
+    rows = db.scalars(select(CrashReport).where(CrashReport.tenant_id == p.tenant_id)
+                      .order_by(CrashReport.ts.desc())).all()
+    lines = ["timestamp,device,eui,reset_reason,fw,pc,backtrace\n"]
+    for c in rows:
+        name = names.get(c.eui) or c.eui
+        lines.append(f"{_iso(c.ts)},{_csv(name)},{c.eui},{_csv(c.reset_reason)},"
+                     f"{_csv(c.fw)},{c.pc},{_csv(c.backtrace)}\n")
+    return Response("".join(lines), media_type="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=crashes.csv"})
 
 
 @app.get("/v1/routers")

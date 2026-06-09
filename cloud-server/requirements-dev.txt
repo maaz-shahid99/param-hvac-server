@@ -1,0 +1,4 @@
+# Dev/test dependencies — NOT installed on the appliance at runtime.
+#   pip install -r requirements-dev.txt
+-r requirements.txt
+httpx==0.28.1     # FastAPI TestClient (test_local.py) + demo_live.py

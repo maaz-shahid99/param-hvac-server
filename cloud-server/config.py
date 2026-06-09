@@ -9,6 +9,35 @@ from __future__ import annotations
 import os
 
 
+def _load_dotenv() -> None:
+    """Load KEY=VALUE pairs from a sibling .env file into the environment, WITHOUT
+    overriding anything already set in the real environment (so a shell export /
+    service manager / the test harness still wins). No external dependency — makes
+    the appliance self-contained: `setup_appliance.py` writes .env and the server
+    picks it up on the next start."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = fh.read()
+    except OSError:
+        return
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key, val = key.strip(), val.strip()
+        if len(val) >= 2 and val[0] in "\"'" and val[-1] == val[0]:
+            val = val[1:-1]                       # quoted -> take verbatim
+        elif " #" in val:
+            val = val.split(" #", 1)[0].strip()   # strip a trailing "  # comment"
+        if key and key not in os.environ:
+            os.environ[key] = val
+
+
+_load_dotenv()
+
+
 def _f(name: str, default: float) -> float:
     try:
         return float(os.environ.get(name, default))

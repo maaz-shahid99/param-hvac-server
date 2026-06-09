@@ -123,6 +123,24 @@ with client:  # triggers lifespan (init_db + watchdog)
     check(client.post("/v1/readings", headers={"X-API-Key": "nope"},
                       json={"sensor_id": "x", "data": "t=1"}).status_code == 401, "bad api key -> 401")
 
+    print("11b) ingest validation: out-of-range temps dropped, bad eui rejected, probe count capped")
+    HARDEUI = "aabbccdd000000ff"
+    h = {"X-API-Key": api_key}
+    # 999 and -300 are outside the DS18B20 range -> treated as err; only 22.0 counts
+    r = client.post("/v1/readings", headers=h, json={"sensor_id": HARDEUI, "data": "t=999.0,22.0,-300.0"})
+    check(r.status_code == 200 and r.json()["max_c"] == 22.0, "out-of-range temps dropped (max_c=22, not 999)")
+    # every probe bad -> nothing to evaluate, max_c falls to 0
+    r = client.post("/v1/readings", headers=h, json={"sensor_id": HARDEUI, "data": "t=999.0,err"})
+    check(r.status_code == 200 and r.json()["max_c"] == 0.0, "all-bad reading -> max_c 0")
+    # a mangled sensor_id never creates a phantom device (the duplicate-sensor bug)
+    r = client.post("/v1/readings", headers=h, json={"sensor_id": "58e6 -> eui=garbage", "data": "t=22.0"})
+    check(r.status_code == 200 and r.json().get("ok") is False, "malformed sensor_id rejected (no phantom)")
+    # a runaway 20-probe payload is capped at MAX_PROBES (<=16)
+    big = "t=" + ",".join(f"{i:016x}:18.0" for i in range(20))
+    r = client.post("/v1/readings", headers=h, json={"sensor_id": HARDEUI, "data": big})
+    rows = [s for s in client.get("/v1/current", headers=auth).json()["sensors"] if s["eui"] == HARDEUI]
+    check(r.status_code == 200 and 0 < len(rows) <= 16, "probe count capped at MAX_PROBES (<=16)")
+
     print("12) password reset via email OTP")
     import re
     # Capture the emailed code (no SES locally) by intercepting notify_email.
@@ -282,5 +300,37 @@ with client:  # triggers lifespan (init_db + watchdog)
     open_high = [a for a in client.get("/v1/alerts?state=open", headers=pauth).json()["alerts"]
                  if a["kind"] == "high_temp"]
     check(not open_high, "probe alert clears when that probe cools")
+
+    print("17) env (router BME) + crashes + collection interval + CSV export")
+    RID = "aabbccdd0000e001"          # a router EUI (Acme tenant)
+    h = {"X-API-Key": api_key}
+    r = client.post("/v1/env", headers=h,
+                    json={"sensor_id": RID, "temp": 31.5, "hum": 45.0, "pres": 995.3, "voc": 70000})
+    check(r.status_code == 200 and r.json().get("ok") is True, "env sample ingested")
+    check(client.post("/v1/env", headers=h, json={"sensor_id": "not-an-eui", "temp": 1}).json().get("ok") is False,
+          "env rejects a malformed eui (no phantom)")
+    envc = client.get("/v1/env/current", headers=auth).json()["env"]
+    check(any(e["eui"] == RID and abs(e["temp"] - 31.5) < 0.01 for e in envc),
+          "env/current shows the router sample")
+    client.put("/v1/settings", headers=auth, json={"collect_interval_s": 120})
+    check(client.get("/v1/settings", headers=auth).json()["collect_interval_s"] == 120,
+          "collect_interval_s set to 120")
+    client.put("/v1/settings", headers=auth, json={"collect_interval_s": 99999})
+    check(client.get("/v1/settings", headers=auth).json()["collect_interval_s"] == 3600,
+          "collect_interval_s clamped to 3600")
+    cr = client.post("/v1/crashes", headers=h, json={"sensor_id": RID, "reset_reason": "panic",
+                     "fw": "c3-v15", "pc": "0x42022000", "backtrace": "0x42022000 0x42025b0e"})
+    check(cr.status_code == 200 and cr.json().get("ok") is True, "crash report ingested")
+    crashes = client.get("/v1/crashes", headers=auth).json()["crashes"]
+    check(any(c["eui"] == RID and c["reset_reason"] == "panic" for c in crashes), "crash report listed")
+    env_csv = client.get("/v1/env/export.csv", headers=auth)
+    check(env_csv.status_code == 200 and env_csv.text.startswith("timestamp,device,eui,temp_c"),
+          "routers env CSV export")
+    sens_csv = client.get("/v1/readings/export.csv", headers=auth)
+    check(sens_csv.status_code == 200 and sens_csv.text.startswith("timestamp,device,eui,probe_rom"),
+          "sensors CSV export")
+    crash_csv = client.get("/v1/crashes/export.csv", headers=auth)
+    check(crash_csv.status_code == 200 and crash_csv.text.startswith("timestamp,device,eui,reset_reason"),
+          "crashes CSV export")
 
 print("\nALL CHECKS PASSED")

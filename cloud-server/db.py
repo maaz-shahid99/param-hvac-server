@@ -59,6 +59,9 @@ class Tenant(Base):
     # (legacy); 'probe' = each mapped probe alerts independently at its own
     # exhaust. Operator-selectable; default preserves the original behavior.
     alert_granularity: Mapped[str] = mapped_column(String(10), default="sensor")
+    # How often (seconds) devices sample/forward env + sensor data. Operator-set;
+    # propagated to the fleet via the gateway config-sync. Default 60s.
+    collect_interval_s: Mapped[int] = mapped_column(Integer, default=60)
     # OPTIONAL extra external alert targets (comma-separated), in addition to the
     # per-member opt-ins. Usually empty — recipients come from member flags.
     alert_emails: Mapped[str] = mapped_column(String(2000), default="")
@@ -167,6 +170,23 @@ class Reading(Base):
     __table_args__ = (Index("ix_reading_tenant_ts", "tenant_id", "ts"),)
 
 
+class EnvReading(Base):
+    """A router/gateway environmental sample (BME280/680): temperature, humidity,
+    pressure, VOC/gas. Routers have no Wi-Fi, so these reach the cloud over the
+    Thread mesh via the active gateway. High-volume time series, keyed like
+    Reading so the live tab + CSV export are cheap, indexed scans."""
+    __tablename__ = "env_readings"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(String(32), ForeignKey("tenants.id"), index=True)
+    ts: Mapped[float] = mapped_column(Float, index=True)
+    eui: Mapped[str] = mapped_column(String(32), index=True)
+    temp: Mapped[float] = mapped_column(Float, default=0.0)
+    hum: Mapped[float] = mapped_column(Float, default=0.0)
+    pres: Mapped[float] = mapped_column(Float, default=0.0)
+    voc: Mapped[float] = mapped_column(Float, default=0.0)
+    __table_args__ = (Index("ix_envreading_tenant_ts", "tenant_id", "ts"),)
+
+
 class MeshNode(Base):
     """A non-sensor Thread mesh device (a router) the gateway reported via
     /v1/mesh. Routers don't send readings, so this is the only record of their
@@ -195,6 +215,24 @@ class CommissionedDevice(Base):
     name: Mapped[str] = mapped_column(String(120), default="")
     added_at: Mapped[float] = mapped_column(Float, default=now)
     __table_args__ = (Index("ix_commdev_tenant_eui", "tenant_id", "eui", unique=True),)
+
+
+class CrashReport(Base):
+    """A firmware panic report forwarded by a device — the gateway directly, a
+    router over the mesh. reset_reason + pc + backtrace come from the ESP
+    core-dump summary; `detail` carries extra text (recent log lines). Kept so an
+    operator can see + download fleet crashes without a serial cable."""
+    __tablename__ = "crash_reports"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    tenant_id: Mapped[str] = mapped_column(String(32), ForeignKey("tenants.id"), index=True)
+    eui: Mapped[str] = mapped_column(String(32), index=True)
+    ts: Mapped[float] = mapped_column(Float, index=True, default=now)
+    reset_reason: Mapped[str] = mapped_column(String(40), default="")
+    fw: Mapped[str] = mapped_column(String(40), default="")
+    pc: Mapped[str] = mapped_column(String(20), default="")
+    backtrace: Mapped[str] = mapped_column(Text, default="")   # space-separated hex addrs
+    detail: Mapped[str] = mapped_column(Text, default="")
+    __table_args__ = (Index("ix_crash_tenant_ts", "tenant_id", "ts"),)
 
 
 class Alert(Base):

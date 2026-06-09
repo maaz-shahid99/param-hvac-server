@@ -1,16 +1,30 @@
-fastapi>=0.104.0
-uvicorn[standard]>=0.24.0
-pydantic>=2.5.0
-SQLAlchemy>=2.0.0
-# Postgres driver for AWS RDS (DATABASE_URL=postgresql+psycopg://...).
-# Not needed for the SQLite local-dev default.
-psycopg[binary]>=3.1.0
-# Password hashing + JWT for the simple email/password auth.
-bcrypt>=4.1.0
-PyJWT>=2.8.0
-# Schema migrations (prod: `alembic upgrade head` before starting the app).
-alembic>=1.13.0
-# AWS SES (email) + SNS (SMS/push). Optional at runtime: if boto3 is absent or
-# AWS is unconfigured, notifications fall back to logging (like the discovery
-# server's SMTP-skipped path), so the service still runs locally.
-boto3>=1.34.0
+# HVAC Cloud Server — pinned dependencies. Versions captured from the validated
+# environment so an appliance build is reproducible (a `>=` floor would pull
+# whatever is newest and can break in the field). Install into a clean venv:
+#   python -m venv .venv && .venv/Scripts/activate     (Windows)
+#   . .venv/bin/activate                               (Linux)
+#   pip install -r requirements.txt
+# For a fully locked build (every transitive pinned), use pip-tools `pip-compile`.
+
+# --- Core runtime (required) ----------------------------------------------
+fastapi==0.135.4
+uvicorn[standard]==0.40.0
+SQLAlchemy==2.0.50
+alembic==1.18.4
+PyJWT==2.13.0
+bcrypt==5.0.0
+pydantic==2.13.4
+python-multipart==0.0.29
+# Direct transitives, pinned so a clean rebuild is byte-reproducible.
+starlette==0.52.1
+anyio==4.12.1
+
+# --- Optional: Postgres driver --------------------------------------------
+# Only needed if DATABASE_URL=postgresql+psycopg://...  The onprem default is
+# SQLite, which needs no driver. Trim this line for a leaner SQLite-only build.
+psycopg[binary]==3.3.4
+
+# --- Optional: AWS SES (email) + SNS (SMS) --------------------------------
+# Only if you use AWS notifications. The onprem default uses SMTP + Twilio
+# (stdlib urllib/smtplib); notifications fall back to logging if boto3 is absent.
+boto3==1.43.22
