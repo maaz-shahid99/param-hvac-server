@@ -84,16 +84,33 @@ All env vars (with safe defaults) are documented in `.env.example`. Key ones:
 | `POST /v1/readings` | X-API-Key | gateway ingest + threshold eval |
 | `GET/PUT /v1/topology` | JWT | rack layout sync (replaces app-local) |
 | `GET/PUT /v1/thresholds` | JWT (PUT=admin) | per-tenant/rack/port limits |
-| `GET /v1/current` | JWT | latest temp per sensor |
+| `GET /v1/current` | JWT | latest temp per **mapped** sensor/probe |
 | `GET /v1/alerts?state=` | JWT | open/all alerts |
 | `POST /v1/alerts/{id}/ack` | JWT | acknowledge an alert |
 | `PUT /v1/recipients` | JWT (admin) | alert email/phone targets |
+| `GET/PUT /v1/settings` | JWT (PUT=admin) | `alert_granularity` + `collect_interval_s` |
+| `POST /v1/env` | X-API-Key | router/gateway **BME** ingest (temp/hum/pres/voc) |
+| `GET /v1/env/current` | JWT | latest BME per device (Environment tab) |
+| `GET /v1/env/probes` | JWT | **every** probe of each mapped sensor (labeled, or "Probe N") |
+| `GET /v1/env/export.csv` · `GET /v1/readings/export.csv` | JWT | env + per-probe CSV (named) |
+| `POST /v1/crashes` | X-API-Key | firmware crash ingest (reset reason, PC, task) |
+| `GET /v1/crashes` · `GET /v1/crashes/export.csv` | JWT | crash list + CSV (Diagnostics page) |
 
 ## Files
-- `app.py` — FastAPI app, endpoints, topology→sensor_map flattening, stale watchdog.
-- `db.py` — SQLAlchemy models (all `tenant_id`-scoped), SQLite/Postgres via `DATABASE_URL`.
+- `app.py` — FastAPI app, endpoints (auth, readings, **env**, **crashes**,
+  topology→sensor_map flattening, CSV exports), stale watchdog.
+- `db.py` — SQLAlchemy models (all `tenant_id`-scoped): adds `EnvReading`,
+  `CrashReport`, and `Tenant.collect_interval_s`. SQLite/Postgres via `DATABASE_URL`.
 - `auth.py` — bcrypt passwords, JWT, API-key hashing, request→tenant dependencies.
 - `thresholds.py` — high-temp + ΔT evaluation, alert lifecycle (hysteresis/cooldown).
 - `notifications.py` — SES/SNS dispatch with log-only fallback.
-- `config.py` — env-driven config with safe defaults.
-- `test_local.py` — end-to-end smoke test.
+- `config.py` — env-driven config with safe defaults + a dependency-free `.env` loader.
+- `migrations/versions/e7c2a9f0b3d1_*` — adds `env_readings`, `crash_reports`,
+  `tenants.collect_interval_s`.
+- `scripts/setup_appliance.py` — one-shot on-prem appliance bootstrap (writes `.env`).
+- `test_local.py` — end-to-end smoke test (now covers env ingest/current, crashes, CSV).
+
+> **Note on schema drift:** a SQLite DB created before these models existed won't
+> have the new columns/tables (`create_all` adds *tables* but never alters
+> existing ones). On the appliance, `alembic stamp head` once, then
+> `alembic upgrade head` — or recreate `cloud.db` from the current models.
