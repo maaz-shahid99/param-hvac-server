@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 .env
 *.db
+# Published OTA firmware images + manifest (runtime artifacts, per-deployment).
+firmware/
