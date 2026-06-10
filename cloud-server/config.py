@@ -61,6 +61,26 @@ JWT_EXPIRE_HOURS = _i("JWT_EXPIRE_HOURS", 720)
 JWT_ALG = "HS256"
 BOOTSTRAP_TOKEN = os.environ.get("BOOTSTRAP_TOKEN", "dev-bootstrap")
 
+# --- Manufacturer field-support access -------------------------------------
+# A shared secret that lets the manufacturer's field-service console read fleet
+# diagnostics (crashes/env/readings/health) and publish firmware over the LAN,
+# WITHOUT a customer account. Blank => the whole /v1/support + OTA-publish API is
+# DISABLED. Set a strong random value on the appliance to enable it.
+SUPPORT_TOKEN = os.environ.get("SUPPORT_TOKEN", "")
+
+# Where published firmware images + manifest.json live (served at /firmware/*).
+FIRMWARE_DIR = os.path.abspath(
+    os.environ.get("FIRMWARE_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "firmware"))
+)
+
+# --- mDNS / Bonjour discovery ----------------------------------------------
+# Advertise a stable hostname on the LAN so the app/console/gateway can reach the
+# appliance by name (http://<MDNS_NAME>.local:PORT) instead of a hard IP. Best-
+# effort: needs the optional `zeroconf` package; a missing dep or failure is a
+# no-op (connect by IP). Off by default in cloud/prod (no LAN).
+MDNS_ENABLED = os.environ.get("MDNS_ENABLED", "1") not in ("", "0", "false", "False")
+MDNS_NAME = os.environ.get("MDNS_NAME", "hvac-appliance")
+
 # --- Password reset (email OTP) --------------------------------------------
 OTP_TTL_S = _f("OTP_TTL_S", 600.0)          # reset code valid for 10 minutes
 OTP_MAX_ATTEMPTS = _i("OTP_MAX_ATTEMPTS", 5)  # wrong-code tries before the code dies
@@ -133,6 +153,8 @@ def validate_startup() -> None:
         problems.append("JWT_SECRET must be a strong random value (>= 32 chars)")
     if BOOTSTRAP_TOKEN == _INSECURE_BOOTSTRAP:
         problems.append("BOOTSTRAP_TOKEN must be changed (or set empty to disable registration)")
+    if SUPPORT_TOKEN and len(SUPPORT_TOKEN) < 24:
+        problems.append("SUPPORT_TOKEN must be a strong random value (>= 24 chars) or empty to disable")
     if IS_PROD:
         # Cloud-only: browser clients + a real database.
         if CORS_ORIGINS == ["*"]:

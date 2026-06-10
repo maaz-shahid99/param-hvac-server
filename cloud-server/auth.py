@@ -139,3 +139,23 @@ def tenant_from_api_key(
     row.last_used_at = time.time()
     db.commit()
     return row.tenant_id
+
+
+# --- Manufacturer field-support access -------------------------------------
+
+class SupportPrincipal:
+    """Marker for a request authenticated by the manufacturer SUPPORT_TOKEN —
+    read-only access ACROSS all tenants on this appliance, plus firmware publish.
+    Distinct from a user/tenant Principal; never carries a tenant scope."""
+
+
+def support_principal(x_support_token: str = Header(default="")) -> SupportPrincipal:
+    """Dependency for /v1/support/* + OTA-publish. Validates the shared support
+    token in constant time. 404 (not 401) when disabled so the feature is invisible
+    on appliances that didn't opt in."""
+    expected = config.SUPPORT_TOKEN
+    if not expected:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found")
+    if not x_support_token or not secrets.compare_digest(x_support_token, expected):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid support token")
+    return SupportPrincipal()

@@ -19,8 +19,10 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
+import socket
 import time
 import uuid
 from collections import defaultdict, deque
@@ -31,13 +33,14 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 import config
 from auth import (
     Principal,
+    SupportPrincipal,
     current_principal,
     generate_api_key,
     generate_org_code,
@@ -47,6 +50,7 @@ from auth import (
     hash_password,
     issue_token,
     require_admin,
+    support_principal,
     tenant_from_api_key,
     verify_password,
 )
@@ -56,12 +60,16 @@ from db import (
     CommissionedDevice,
     CrashReport,
     EnvReading,
+    FirmwareRelease,
+    FleetStatus,
     MeshNode,
+    OtaState,
     PasswordReset,
     Reading,
     SensorMap,
     SessionLocal,
     SingletonLease,
+    SupportAudit,
     Tenant,
     Threshold,
     Topology,
@@ -277,14 +285,71 @@ def _scan_stale() -> None:
 # --------------------------------------------------------------------------- #
 
 @asynccontextmanager
+def _lan_ip() -> str:
+    """Best-effort primary LAN IP (no traffic actually sent)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+async def _mdns_start(app: FastAPI) -> None:
+    """Advertise the appliance as <MDNS_NAME>.local over mDNS so clients connect by
+    name. Optional + fails open: a missing `zeroconf` or any error just logs and
+    skips (you can always connect by IP)."""
+    if not config.MDNS_ENABLED:
+        return
+    try:
+        from zeroconf import ServiceInfo, Zeroconf
+    except Exception:
+        print("[mdns] zeroconf not installed — skipping (connect by IP)")
+        return
+    try:
+        ip = _lan_ip()
+        info = ServiceInfo(
+            "_http._tcp.local.",
+            f"{config.MDNS_NAME}._http._tcp.local.",
+            addresses=[socket.inet_aton(ip)],
+            port=config.PORT,
+            properties={"path": "/", "role": "hvac-appliance"},
+            server=f"{config.MDNS_NAME}.local.",
+        )
+        zc = Zeroconf()
+        await asyncio.to_thread(zc.register_service, info)
+        app.state.zeroconf = zc
+        app.state.zeroconf_info = info
+        print(f"[mdns] advertising http://{config.MDNS_NAME}.local:{config.PORT} ({ip})")
+    except Exception as e:  # noqa: BLE001 — discovery is best-effort
+        print(f"[mdns] registration failed (connect by IP): {e}")
+
+
+def _mdns_stop(app: FastAPI) -> None:
+    zc = getattr(app.state, "zeroconf", None)
+    info = getattr(app.state, "zeroconf_info", None)
+    if zc is None:
+        return
+    try:
+        if info is not None:
+            zc.unregister_service(info)
+        zc.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def lifespan(app: FastAPI):
     config.validate_startup()   # fail fast on insecure onprem/prod config (no-op in dev)
     init_db()
+    await _mdns_start(app)
     task = asyncio.create_task(stale_watchdog())
     try:
         yield
     finally:
         task.cancel()
+        _mdns_stop(app)
 
 
 app = FastAPI(title="HVAC Cloud Server", lifespan=lifespan)
@@ -631,6 +696,11 @@ def ingest(body: IngestBody, tenant_id: str = Depends(tenant_from_api_key),
 class MeshBody(BaseModel):
     nodes: list[dict] = []     # [{"eui": "...", "role": "G|R"}]
     routers: list[dict] = []   # legacy: [{"eui": "..."}] (treated as routers)
+    # The active gateway's self-report (optional) — drives fleet health + OTA.
+    fw_c3: int | None = None
+    fw_c6: int | None = None
+    heap_free: int | None = None
+    role: str | None = None
 
 
 @app.post("/v1/mesh")
@@ -639,8 +709,23 @@ def ingest_mesh(body: MeshBody, tenant_id: str = Depends(tenant_from_api_key),
     """Gateway posts the live C6 mesh roster (gateway + routers — these have no
     readings of their own). Upserts each as a MeshNode with a fresh last_seen +
     kind; the dashboard derives online/offline from the timestamp, and the
-    'gateway' kind moves on failover."""
+    'gateway' kind moves on failover. The optional self-report (fw/heap/role) is
+    upserted into FleetStatus for the support console + OTA version comparison."""
     ts = now()
+    if any(v is not None for v in (body.fw_c3, body.fw_c6, body.heap_free, body.role)):
+        fs = db.get(FleetStatus, tenant_id)
+        if not fs:
+            fs = FleetStatus(tenant_id=tenant_id)
+            db.add(fs)
+        if body.fw_c3 is not None:
+            fs.fw_c3 = body.fw_c3
+        if body.fw_c6 is not None:
+            fs.fw_c6 = body.fw_c6
+        if body.heap_free is not None:
+            fs.heap_free = body.heap_free
+        if body.role is not None:
+            fs.role = body.role[:16]
+        fs.updated_at = ts
     items: list[tuple[str, str]] = []
     for n in body.nodes:
         eui = str(n.get("eui", "")).strip().lower()
@@ -1091,6 +1176,316 @@ def set_recipients(body: RecipientsBody, p: Principal = Depends(require_admin),
     return {"ok": True}
 
 
+# --------------------------------------------------------------------------- #
+# Manufacturer field-support plane — gated by SUPPORT_TOKEN (X-Support-Token).  #
+# Read-only fleet diagnostics ACROSS tenants on this appliance + firmware        #
+# publish. Disabled (404) unless config.SUPPORT_TOKEN is set.                    #
+# --------------------------------------------------------------------------- #
+
+def _audit(db: Session, action: str, detail: str = "") -> None:
+    """Record manufacturer support access so the customer can review it later."""
+    db.add(SupportAudit(action=action[:60], detail=detail[:500]))
+
+
+def _tenant_names(db: Session) -> dict:
+    return {t.id: t.name for t in db.scalars(select(Tenant)).all()}
+
+
+@app.get("/v1/support/overview")
+def support_overview(sp: SupportPrincipal = Depends(support_principal),
+                     db: Session = Depends(get_db)):
+    """Cross-tenant fleet health: per-tenant gateway firmware/heap/role, mesh
+    roster + online state, and crash/alert counts."""
+    cutoff = now() - config.STALE_AFTER_S
+    out = []
+    for t in db.scalars(select(Tenant)).all():
+        fs = db.get(FleetStatus, t.id)
+        nodes = db.scalars(select(MeshNode).where(MeshNode.tenant_id == t.id)
+                           .order_by(MeshNode.last_seen.desc())).all()
+        crash_n = db.scalar(select(func.count()).select_from(CrashReport)
+                            .where(CrashReport.tenant_id == t.id)) or 0
+        open_n = db.scalar(select(func.count()).select_from(Alert).where(
+            Alert.tenant_id == t.id, Alert.state.in_(("open", "acked")))) or 0
+        out.append({
+            "tenant_id": t.id, "tenant": t.name,
+            "fw_c3": fs.fw_c3 if fs else 0, "fw_c6": fs.fw_c6 if fs else 0,
+            "heap_free": fs.heap_free if fs else 0, "role": fs.role if fs else "",
+            "status_age_s": (now() - fs.updated_at) if fs else None,
+            "nodes": [{"eui": m.eui, "kind": m.kind, "last_seen": m.last_seen,
+                       "online": m.last_seen >= cutoff} for m in nodes],
+            "crash_count": int(crash_n), "open_alerts": int(open_n),
+        })
+    _audit(db, "read.overview", f"{len(out)} tenants")
+    db.commit()
+    return {"tenants": out}
+
+
+@app.get("/v1/support/crashes")
+def support_crashes(sp: SupportPrincipal = Depends(support_principal),
+                    db: Session = Depends(get_db), format: str = "json"):
+    rows = db.scalars(select(CrashReport).order_by(CrashReport.ts.desc()).limit(2000)).all()
+    tnames = _tenant_names(db)
+    if format == "csv":
+        lines = ["timestamp,tenant,eui,reset_reason,fw,pc,backtrace\n"]
+        for c in rows:
+            lines.append(f"{_iso(c.ts)},{_csv(tnames.get(c.tenant_id, ''))},{c.eui},"
+                         f"{_csv(c.reset_reason)},{_csv(c.fw)},{c.pc},{_csv(c.backtrace)}\n")
+        _audit(db, "read.crashes.csv", f"{len(rows)} rows")
+        db.commit()
+        return Response("".join(lines), media_type="text/csv",
+                        headers={"Content-Disposition": "attachment; filename=fleet_crashes.csv"})
+    _audit(db, "read.crashes", f"{len(rows)} rows")
+    db.commit()
+    return {"crashes": [{"id": c.id, "tenant": tnames.get(c.tenant_id, ""), "eui": c.eui,
+                         "ts": c.ts, "reset_reason": c.reset_reason, "fw": c.fw, "pc": c.pc,
+                         "backtrace": c.backtrace, "detail": c.detail} for c in rows]}
+
+
+@app.get("/v1/support/env")
+def support_env(sp: SupportPrincipal = Depends(support_principal),
+                db: Session = Depends(get_db), format: str = "json", limit: int = 5000):
+    rows = db.scalars(select(EnvReading).order_by(EnvReading.ts.desc())
+                      .limit(min(limit, 20000))).all()
+    tnames = _tenant_names(db)
+    if format == "csv":
+        lines = ["timestamp,tenant,eui,temp_c,humidity_pct,pressure_hpa,voc\n"]
+        for r in rows:
+            lines.append(f"{_iso(r.ts)},{_csv(tnames.get(r.tenant_id, ''))},{r.eui},"
+                         f"{r.temp:.2f},{r.hum:.2f},{r.pres:.2f},{r.voc:.2f}\n")
+        _audit(db, "read.env.csv", f"{len(rows)} rows")
+        db.commit()
+        return Response("".join(lines), media_type="text/csv",
+                        headers={"Content-Disposition": "attachment; filename=fleet_env.csv"})
+    _audit(db, "read.env", f"{len(rows)} rows")
+    db.commit()
+    return {"env": [{"tenant": tnames.get(r.tenant_id, ""), "eui": r.eui, "ts": r.ts,
+                     "temp": r.temp, "hum": r.hum, "pres": r.pres, "voc": r.voc} for r in rows]}
+
+
+@app.get("/v1/support/readings")
+def support_readings(sp: SupportPrincipal = Depends(support_principal),
+                     db: Session = Depends(get_db), format: str = "json", limit: int = 5000):
+    rows = db.scalars(select(Reading).order_by(Reading.ts.desc())
+                      .limit(min(limit, 20000))).all()
+    tnames = _tenant_names(db)
+    if format == "csv":
+        lines = ["timestamp,tenant,eui,probe_rom,temp_c,max_c\n"]
+        for r in rows:
+            try:
+                probes = json.loads(r.probes)
+            except (ValueError, TypeError):
+                probes = []
+            for pr in probes:
+                if not isinstance(pr, dict):
+                    continue
+                c = pr.get("c")
+                lines.append(f"{_iso(r.ts)},{_csv(tnames.get(r.tenant_id, ''))},{r.eui},"
+                             f"{pr.get('rom', '')},{'' if c is None else f'{float(c):.2f}'},{r.max_c:.2f}\n")
+        _audit(db, "read.readings.csv", f"{len(rows)} rows")
+        db.commit()
+        return Response("".join(lines), media_type="text/csv",
+                        headers={"Content-Disposition": "attachment; filename=fleet_readings.csv"})
+    _audit(db, "read.readings", f"{len(rows)} rows")
+    db.commit()
+    return {"readings": [{"tenant": tnames.get(r.tenant_id, ""), "eui": r.eui, "ts": r.ts,
+                          "max_c": r.max_c, "probes": r.probes} for r in rows]}
+
+
+@app.get("/v1/support/alerts")
+def support_alerts(sp: SupportPrincipal = Depends(support_principal),
+                   db: Session = Depends(get_db)):
+    rows = db.scalars(select(Alert).order_by(Alert.opened_at.desc()).limit(1000)).all()
+    tnames = _tenant_names(db)
+    _audit(db, "read.alerts", f"{len(rows)} rows")
+    db.commit()
+    return {"alerts": [{"id": a.id, "tenant": tnames.get(a.tenant_id, ""), "eui": a.eui,
+                        "kind": a.kind, "state": a.state, "location": a.location,
+                        "value": a.value, "threshold": a.threshold,
+                        "opened_at": a.opened_at, "cleared_at": a.cleared_at} for a in rows]}
+
+
+# ---- firmware releases + hosting (manufacturer publishes; gateways pull) ---- #
+
+def _latest_release(db: Session, kind: str) -> FirmwareRelease | None:
+    return db.scalar(select(FirmwareRelease).where(FirmwareRelease.kind == kind)
+                     .order_by(FirmwareRelease.version.desc(),
+                               FirmwareRelease.created_at.desc()).limit(1))
+
+
+def _write_manifest(db: Session) -> dict:
+    """Regenerate firmware/manifest.json from the newest release per chip, in the
+    exact shape the C3 OTA reader expects (c3_version/c3file, c6_version/c6file)
+    plus severity + sha256 for the tiered rollout + integrity."""
+    os.makedirs(config.FIRMWARE_DIR, exist_ok=True)
+    c3, c6 = _latest_release(db, "c3"), _latest_release(db, "c6")
+    manifest = {
+        "c3_version": c3.version if c3 else 0, "c3file": c3.filename if c3 else "",
+        "c3_severity": c3.severity if c3 else "optional", "c3_sha256": c3.sha256 if c3 else "",
+        "c6_version": c6.version if c6 else 0, "c6file": c6.filename if c6 else "",
+        "c6_severity": c6.severity if c6 else "optional", "c6_sha256": c6.sha256 if c6 else "",
+    }
+    with open(os.path.join(config.FIRMWARE_DIR, "manifest.json"), "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh)
+    return manifest
+
+
+@app.post("/v1/support/firmware")
+async def publish_firmware(request: Request, kind: str, version: int,
+                           severity: str = "optional", stage: str = "full", notes: str = "",
+                           sp: SupportPrincipal = Depends(support_principal),
+                           db: Session = Depends(get_db)):
+    """Publish a firmware image. Metadata in the query string, the raw .bin as the
+    request body (no multipart dep). `stage=canary` rolls only the gateway first
+    (verify-first) until promoted; `full` rolls the fleet. Stores the bin + a
+    FirmwareRelease row and rewrites the manifest the fleet polls."""
+    kind = kind.lower().strip()
+    severity = severity.lower().strip()
+    stage = stage.lower().strip()
+    if kind not in ("c3", "c6"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "kind must be c3 or c6")
+    if severity not in ("mandatory", "optional"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "severity must be mandatory or optional")
+    if stage not in ("canary", "full"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "stage must be canary or full")
+    data = await request.body()
+    if not data:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "empty firmware body")
+    os.makedirs(config.FIRMWARE_DIR, exist_ok=True)
+    filename = f"{kind}_v{version}.bin"
+    with open(os.path.join(config.FIRMWARE_DIR, filename), "wb") as fh:
+        fh.write(data)
+    sha = hashlib.sha256(data).hexdigest()
+    db.add(FirmwareRelease(kind=kind, version=version, severity=severity, stage=stage,
+                           filename=filename, size=len(data), sha256=sha, notes=notes[:2000]))
+    _audit(db, "firmware.publish", f"{kind} v{version} {severity}/{stage} {len(data)}B")
+    db.commit()
+    manifest = _write_manifest(db)
+    return {"ok": True, "kind": kind, "version": version, "stage": stage, "filename": filename,
+            "size": len(data), "sha256": sha, "manifest": manifest}
+
+
+class OtaPromoteBody(BaseModel):
+    kind: str
+    version: int
+
+
+@app.post("/v1/support/ota/promote")
+def promote_firmware(body: OtaPromoteBody, sp: SupportPrincipal = Depends(support_principal),
+                     db: Session = Depends(get_db)):
+    """Promote a canary release to full so the gateway rolls it to the whole fleet
+    (do this after the gateway reports the new version healthy)."""
+    kind = body.kind.lower().strip()
+    if kind not in ("c3", "c6"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "kind must be c3 or c6")
+    rel = db.scalar(select(FirmwareRelease).where(
+        FirmwareRelease.kind == kind, FirmwareRelease.version == body.version))
+    if not rel:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "release not found")
+    rel.stage = "full"
+    _audit(db, "ota.promote", f"{kind} v{body.version} -> full")
+    db.commit()
+    return {"ok": True, "kind": kind, "version": body.version, "stage": "full"}
+
+
+@app.get("/v1/support/firmware")
+def list_firmware(sp: SupportPrincipal = Depends(support_principal),
+                  db: Session = Depends(get_db)):
+    rows = db.scalars(select(FirmwareRelease)
+                      .order_by(FirmwareRelease.created_at.desc()).limit(200)).all()
+    return {"releases": [{"id": r.id, "kind": r.kind, "version": r.version,
+                          "severity": r.severity, "stage": r.stage, "filename": r.filename,
+                          "size": r.size, "sha256": r.sha256, "notes": r.notes,
+                          "created_at": r.created_at} for r in rows]}
+
+
+@app.get("/firmware/manifest.json")
+def firmware_manifest():
+    """Served to the gateway's OTA poll. Defined before the SPA catch-all so it
+    isn't shadowed (and `firmware` is in _API_PREFIXES below)."""
+    path = os.path.join(config.FIRMWARE_DIR, "manifest.json")
+    if os.path.isfile(path):
+        return FileResponse(path, media_type="application/json")
+    return {"c3_version": 0, "c3file": "", "c6_version": 0, "c6file": ""}
+
+
+@app.get("/firmware/{filename}")
+def firmware_file(filename: str):
+    safe = os.path.normpath(os.path.join(config.FIRMWARE_DIR, filename))
+    if not safe.startswith(config.FIRMWARE_DIR) or not os.path.isfile(safe):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "firmware not found")
+    return FileResponse(safe, media_type="application/octet-stream")
+
+
+# ---- tiered OTA orchestration ---------------------------------------------- #
+
+@app.get("/v1/ota/check")
+def ota_check(tenant_id: str = Depends(tenant_from_api_key), db: Session = Depends(get_db)):
+    """The gateway polls this. Returns the current target per chip + severity, and
+    whether this tenant's admin has approved an OPTIONAL version. The gateway
+    builds the image URL from its own configured cloud URL (`/firmware/<file>`)."""
+    c3, c6 = _latest_release(db, "c3"), _latest_release(db, "c6")
+    st = db.get(OtaState, tenant_id)
+    return {
+        "c3_version": c3.version if c3 else 0, "c3file": c3.filename if c3 else "",
+        "c3_severity": c3.severity if c3 else "optional", "c3_stage": c3.stage if c3 else "full",
+        "c6_version": c6.version if c6 else 0, "c6file": c6.filename if c6 else "",
+        "c6_severity": c6.severity if c6 else "optional", "c6_stage": c6.stage if c6 else "full",
+        "approved_c3": st.approved_c3 if st else 0,
+        "approved_c6": st.approved_c6 if st else 0,
+    }
+
+
+@app.get("/v1/ota/available")
+def ota_available(p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    """The customer app polls this — surfaces an OPTIONAL update newer than the
+    fleet's current firmware so the user can choose to apply it. Mandatory updates
+    aren't listed (they auto-apply)."""
+    fs = db.get(FleetStatus, p.tenant_id)
+    st = db.get(OtaState, p.tenant_id)
+    out = []
+    for kind, cur, appr in (("c3", fs.fw_c3 if fs else 0, st.approved_c3 if st else 0),
+                            ("c6", fs.fw_c6 if fs else 0, st.approved_c6 if st else 0)):
+        rel = _latest_release(db, kind)
+        if rel and rel.severity == "optional" and rel.version > cur:
+            out.append({"kind": kind, "version": rel.version, "current": cur,
+                        "notes": rel.notes, "approved": appr >= rel.version})
+    return {"updates": out}
+
+
+class OtaApproveBody(BaseModel):
+    kind: str
+    version: int
+
+
+@app.post("/v1/ota/approve")
+def ota_approve(body: OtaApproveBody, p: Principal = Depends(require_admin),
+                db: Session = Depends(get_db)):
+    """The customer admin approves an optional update; the gateway applies it on
+    its next poll."""
+    kind = body.kind.lower().strip()
+    if kind not in ("c3", "c6"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "kind must be c3 or c6")
+    st = db.get(OtaState, p.tenant_id)
+    if not st:
+        st = OtaState(tenant_id=p.tenant_id)
+        db.add(st)
+    if kind == "c3":
+        st.approved_c3 = body.version
+    else:
+        st.approved_c6 = body.version
+    st.updated_at = now()
+    db.commit()
+    return {"ok": True, "kind": kind, "approved_version": body.version}
+
+
+@app.get("/v1/support-access")
+def support_access_log(p: Principal = Depends(require_admin), db: Session = Depends(get_db)):
+    """Customer-visible audit of manufacturer support-token access to this
+    appliance (transparency/trust)."""
+    rows = db.scalars(select(SupportAudit).order_by(SupportAudit.ts.desc()).limit(500)).all()
+    return {"access": [{"ts": a.ts, "action": a.action, "detail": a.detail} for a in rows]}
+
+
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -1107,7 +1502,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 WEB_DIR = os.path.abspath(
     os.environ.get("WEB_DIR", os.path.join(_HERE, "..", "web-dashboard", "dist"))
 )
-_API_PREFIXES = ("v1/", "v1", "health", "docs", "redoc", "openapi.json")
+_API_PREFIXES = ("v1/", "v1", "health", "docs", "redoc", "openapi.json", "firmware/", "firmware")
 
 if os.path.isdir(WEB_DIR):
     _INDEX = os.path.join(WEB_DIR, "index.html")

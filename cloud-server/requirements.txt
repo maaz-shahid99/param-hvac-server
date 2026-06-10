@@ -28,3 +28,8 @@ psycopg[binary]==3.3.4
 # Only if you use AWS notifications. The onprem default uses SMTP + Twilio
 # (stdlib urllib/smtplib); notifications fall back to logging if boto3 is absent.
 boto3==1.43.22
+
+# --- Optional: mDNS / Bonjour discovery (hvac-appliance.local) ------------
+# Lets the LAN reach the appliance by name. Best-effort: the server skips mDNS
+# (connect by IP) if this isn't installed. Omit for a leaner build.
+zeroconf==0.131.0

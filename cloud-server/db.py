@@ -252,6 +252,63 @@ class Alert(Base):
     __table_args__ = (Index("ix_alert_open", "tenant_id", "eui", "kind", "state"),)
 
 
+class FirmwareRelease(Base):
+    """A firmware image the manufacturer published for the fleet to OTA onto.
+    `kind` picks the chip (c3/c6); `severity` drives rollout — 'mandatory' is
+    auto-applied fleet-wide by the gateway's OTA poll, 'optional' waits for an
+    in-app approval. The highest `version` per kind is the current target. The
+    .bin lives on disk under config.FIRMWARE_DIR and is served at /firmware/<file>."""
+    __tablename__ = "firmware_releases"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    kind: Mapped[str] = mapped_column(String(4), index=True)          # c3|c6
+    version: Mapped[int] = mapped_column(Integer, index=True)
+    severity: Mapped[str] = mapped_column(String(10), default="optional")  # mandatory|optional
+    # Rollout stage: 'canary' = only the gateway self-updates (verify-first);
+    # 'full' = the gateway broadcasts to the whole fleet. Promote canary->full
+    # once the gateway reports the new version healthy.
+    stage: Mapped[str] = mapped_column(String(10), default="full")    # canary|full
+    filename: Mapped[str] = mapped_column(String(200), default="")
+    size: Mapped[int] = mapped_column(Integer, default=0)
+    sha256: Mapped[str] = mapped_column(String(64), default="")
+    notes: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[float] = mapped_column(Float, default=now, index=True)
+
+
+class OtaState(Base):
+    """Per-tenant approval of an OPTIONAL firmware version. A customer admin
+    approves a version in the app; the gateway applies it on its next OTA poll.
+    Mandatory updates ignore this (always auto-applied)."""
+    __tablename__ = "ota_state"
+    tenant_id: Mapped[str] = mapped_column(String(32), ForeignKey("tenants.id"), primary_key=True)
+    approved_c3: Mapped[int] = mapped_column(Integer, default=0)
+    approved_c6: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[float] = mapped_column(Float, default=now)
+
+
+class FleetStatus(Base):
+    """The active gateway's self-reported status (firmware versions, heap, role),
+    upserted from the /v1/mesh roster post. Drives the support console's fleet
+    health and the OTA 'is there a newer version' comparison."""
+    __tablename__ = "fleet_status"
+    tenant_id: Mapped[str] = mapped_column(String(32), ForeignKey("tenants.id"), primary_key=True)
+    fw_c3: Mapped[int] = mapped_column(Integer, default=0)
+    fw_c6: Mapped[int] = mapped_column(Integer, default=0)
+    heap_free: Mapped[int] = mapped_column(Integer, default=0)
+    role: Mapped[str] = mapped_column(String(16), default="")
+    updated_at: Mapped[float] = mapped_column(Float, default=now)
+
+
+class SupportAudit(Base):
+    """Append-only log of manufacturer support-token access — every read + every
+    firmware publish — so a customer admin can see when their appliance was
+    serviced and what was touched."""
+    __tablename__ = "support_audit"
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    ts: Mapped[float] = mapped_column(Float, default=now, index=True)
+    action: Mapped[str] = mapped_column(String(60), default="")
+    detail: Mapped[str] = mapped_column(String(500), default="")
+
+
 class SingletonLease(Base):
     """A short-lived leader lease so exactly one process runs a singleton job
     (the stale-sensor watchdog) even when the API is scaled to many workers.

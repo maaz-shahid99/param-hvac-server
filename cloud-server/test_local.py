@@ -20,6 +20,10 @@ if not os.environ.get("DATABASE_URL"):
 os.environ["BOOTSTRAP_TOKEN"] = "test-boot"
 os.environ["HYSTERESIS_C"] = "3"
 os.environ["JWT_SECRET"] = "test-secret-key-at-least-32-bytes-long-xx"
+os.environ["SUPPORT_TOKEN"] = "test-support-token-at-least-24-chars"
+# Isolate firmware artifacts from any real appliance dir.
+os.environ["FIRMWARE_DIR"] = os.path.join(tempfile.gettempdir(), "hvac_test_firmware")
+os.environ["MDNS_ENABLED"] = "0"   # don't advertise a real mDNS service during tests
 
 print(f"Testing against: {os.environ['DATABASE_URL'].split('@')[-1]}")
 
@@ -332,5 +336,62 @@ with client:  # triggers lifespan (init_db + watchdog)
     crash_csv = client.get("/v1/crashes/export.csv", headers=auth)
     check(crash_csv.status_code == 200 and crash_csv.text.startswith("timestamp,device,eui,reset_reason"),
           "crashes CSV export")
+
+    print("18) manufacturer support plane + firmware publish + tiered OTA")
+    sup = {"X-Support-Token": os.environ["SUPPORT_TOKEN"]}
+    check(client.get("/v1/support/overview").status_code == 401, "support requires a token")
+    check(client.get("/v1/support/overview", headers={"X-Support-Token": "wrong"}).status_code == 401,
+          "support rejects a bad token")
+    ov = client.get("/v1/support/overview", headers=sup)
+    check(ov.status_code == 200 and any("Acme" in t["tenant"] for t in ov.json()["tenants"]),
+          "support overview lists tenants cross-tenant")
+    # gateway self-report -> FleetStatus (fw versions + heap + role)
+    client.post("/v1/mesh", headers=h, json={"nodes": [{"eui": RID, "role": "G"}],
+                "fw_c3": 17, "fw_c6": 16, "heap_free": 88000, "role": "LEADER"})
+    acme = next(t for t in client.get("/v1/support/overview", headers=sup).json()["tenants"]
+                if "Acme" in t["tenant"])
+    check(acme["fw_c3"] == 17 and acme["role"] == "LEADER", "fleet status (fw/role) reported via /v1/mesh")
+    check(client.get("/v1/support/crashes?format=csv", headers=sup).text.startswith("timestamp,tenant,eui"),
+          "support crashes CSV (cross-tenant)")
+    check(client.get("/v1/support/env", headers=sup).status_code == 200
+          and client.get("/v1/support/readings", headers=sup).status_code == 200
+          and client.get("/v1/support/alerts", headers=sup).status_code == 200, "support env/readings/alerts read")
+    # publish an OPTIONAL c3 v18 -> manifest + served bin
+    pub = client.post("/v1/support/firmware?kind=c3&version=18&severity=optional&notes=test%20build",
+                      headers=sup, content=b"\x00\x01\x02fakebin")
+    check(pub.status_code == 200 and pub.json()["manifest"]["c3_version"] == 18, "publish optional c3 v18 -> manifest")
+    man = client.get("/firmware/manifest.json")
+    check(man.status_code == 200 and man.json()["c3_version"] == 18 and man.json()["c3_severity"] == "optional",
+          "manifest served at /firmware with severity")
+    check(client.get("/firmware/c3_v18.bin").content == b"\x00\x01\x02fakebin", "firmware bin served")
+    # gateway poll: optional + not yet approved
+    chk = client.get("/v1/ota/check", headers=h).json()
+    check(chk["c3_version"] == 18 and chk["c3_severity"] == "optional" and chk["approved_c3"] == 0,
+          "ota/check: optional, unapproved")
+    # app sees it available (fleet on 17 < 18); admin approves; gateway poll now approved
+    av = client.get("/v1/ota/available", headers=auth).json()["updates"]
+    check(any(u["kind"] == "c3" and u["version"] == 18 and not u["approved"] for u in av),
+          "ota/available surfaces the optional update")
+    client.post("/v1/ota/approve", headers=auth, json={"kind": "c3", "version": 18})
+    check(client.get("/v1/ota/check", headers=h).json()["approved_c3"] == 18, "approve -> ota/check approved_c3=18")
+    # publish a MANDATORY c6 v17
+    client.post("/v1/support/firmware?kind=c6&version=17&severity=mandatory", headers=sup, content=b"c6bin")
+    check(client.get("/v1/ota/check", headers=h).json()["c6_severity"] == "mandatory", "mandatory c6 published")
+    # canary -> promote: publish c3 v19 as CANARY (gateway self-updates first)
+    client.post("/v1/support/firmware?kind=c3&version=19&severity=mandatory&stage=canary",
+                headers=sup, content=b"c3v19canary")
+    chk = client.get("/v1/ota/check", headers=h).json()
+    check(chk["c3_version"] == 19 and chk["c3_stage"] == "canary", "canary publish -> ota/check stage=canary")
+    check(any(r["version"] == 19 and r["stage"] == "canary"
+              for r in client.get("/v1/support/firmware", headers=sup).json()["releases"]),
+          "release listed with stage")
+    pr = client.post("/v1/support/ota/promote", headers=sup, json={"kind": "c3", "version": 19})
+    check(pr.status_code == 200 and pr.json()["stage"] == "full", "promote canary -> full")
+    check(client.get("/v1/ota/check", headers=h).json()["c3_stage"] == "full",
+          "ota/check stage=full after promote")
+    # access is audit-logged + visible to the customer admin
+    acc = client.get("/v1/support-access", headers=auth).json()["access"]
+    check(any(a["action"] == "firmware.publish" for a in acc) and any(a["action"].startswith("read.") for a in acc),
+          "support access is audit-logged for the customer")
 
 print("\nALL CHECKS PASSED")
