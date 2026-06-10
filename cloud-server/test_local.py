@@ -24,6 +24,9 @@ os.environ["SUPPORT_TOKEN"] = "test-support-token-at-least-24-chars"
 # Isolate firmware artifacts from any real appliance dir.
 os.environ["FIRMWARE_DIR"] = os.path.join(tempfile.gettempdir(), "hvac_test_firmware")
 os.environ["MDNS_ENABLED"] = "0"   # don't advertise a real mDNS service during tests
+# Test isolation: never send real email/SMS even if a .env has Gmail/SES configured.
+os.environ["SMTP_HOST"] = ""
+os.environ["SES_FROM"] = ""
 
 print(f"Testing against: {os.environ['DATABASE_URL'].split('@')[-1]}")
 
@@ -147,9 +150,13 @@ with client:  # triggers lifespan (init_db + watchdog)
 
     print("12) password reset via email OTP")
     import re
-    # Capture the emailed code (no SES locally) by intercepting notify_email.
+    # Capture sent email by intercepting notify_email in BOTH modules that call it
+    # (app.py for OTP, thresholds.py for alerts — each has its own import binding).
+    import thresholds as _thr
     sent: list[str] = []
-    appmod.notify_email = lambda to, subject, body: sent.append(body)
+    _cap = lambda to, subject, body: sent.append(f"{subject}\n{body}")  # noqa: E731
+    appmod.notify_email = _cap
+    _thr.notify_email = _cap
 
     # forgot always 200, even for an unknown email (no enumeration), but only a
     # real user gets a code emitted.
@@ -393,5 +400,24 @@ with client:  # triggers lifespan (init_db + watchdog)
     acc = client.get("/v1/support-access", headers=auth).json()["access"]
     check(any(a["action"] == "firmware.publish" for a in acc) and any(a["action"].startswith("read.") for a in acc),
           "support access is audit-logged for the customer")
+
+    print("19) crash reports are admin-only; router offline/online emails")
+    from db import MeshNode as _MN
+    import time as _time
+    # #1 crash reports gated to admin (members get 403)
+    check(client.get("/v1/crashes", headers=auth).status_code == 200, "admin can read crashes")
+    check(client.get("/v1/crashes", headers=mauth).status_code == 403, "member CANNOT read crashes")
+    check(client.get("/v1/crashes/export.csv", headers=mauth).status_code == 403, "member CANNOT export crashes")
+    # #2 router offline -> OFFLINE email; back online -> BACK ONLINE recovery email
+    sent.clear()
+    with _SL() as s:
+        s.add(_MN(tenant_id=tid, eui="58e6c5ffaaaa0001", kind="router", last_seen=_time.time() - 9999))
+        s.commit()
+    appmod._scan_stale()
+    check(any("OFFLINE" in b for b in sent), "offline router -> OFFLINE alert email")
+    sent.clear()
+    client.post("/v1/mesh", headers=h, json={"nodes": [{"eui": "58e6c5ffaaaa0001", "role": "R"}]})
+    appmod._scan_stale()
+    check(any("BACK ONLINE" in b for b in sent), "router back online -> recovery email")
 
 print("\nALL CHECKS PASSED")

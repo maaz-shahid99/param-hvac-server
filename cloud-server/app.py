@@ -265,10 +265,21 @@ async def stale_watchdog() -> None:
             print(f"[watchdog] error: {exc}")
 
 
+def _mesh_label(db: Session, mn: MeshNode) -> str:
+    """Friendly label for a mesh node (router/gateway) in offline/online alerts."""
+    d = db.scalar(select(CommissionedDevice).where(
+        CommissionedDevice.tenant_id == mn.tenant_id, CommissionedDevice.eui == mn.eui))
+    if d and d.name:
+        return d.name
+    return f"{mn.kind or 'router'} {mn.eui}"
+
+
 def _scan_stale() -> None:
     cutoff = now() - config.STALE_AFTER_S
     with SessionLocal() as db:
-        from thresholds import _open_alert  # local import avoids a cycle at import time
+        from thresholds import _clear_alert, _open_alert  # local import avoids a cycle
+        # Mapped sensors: offline if their latest reading is stale. (Recovery for
+        # sensors fires in the readings-ingest path when a fresh reading arrives.)
         for sm in db.scalars(select(SensorMap)).all():
             last = db.scalar(
                 select(Reading).where(Reading.tenant_id == sm.tenant_id, Reading.eui == sm.eui)
@@ -278,6 +289,16 @@ def _scan_stale() -> None:
                 loc = sm.label or f"sensor {sm.eui}"
                 _open_alert(db, sm.tenant_id, recipients_for(db, sm.tenant_id),
                             sm.eui, "stale", loc, 0.0, 0.0)
+        # Routers + gateway: they send no readings, so liveness is the mesh-roster
+        # last_seen. Open an OFFLINE alert when stale; clear it + send a BACK ONLINE
+        # email when they reappear (a no-op when there's no open alert).
+        for mn in db.scalars(select(MeshNode)).all():
+            rec = recipients_for(db, mn.tenant_id)
+            label = _mesh_label(db, mn)
+            if mn.last_seen < cutoff:
+                _open_alert(db, mn.tenant_id, rec, mn.eui, "stale", label, 0.0, 0.0)
+            else:
+                _clear_alert(db, mn.tenant_id, mn.eui, "stale", rec, label)
 
 
 # --------------------------------------------------------------------------- #
@@ -685,9 +706,12 @@ def ingest(body: IngestBody, tenant_id: str = Depends(tenant_from_api_key),
     ))
     db.commit()
 
-    # A fresh reading clears any open "stale" alert for this sensor.
-    _clear_alert(db, tenant_id, eui, "stale")
-    evaluate_reading(db, tenant_id, eui, probes, mx, recipients_for(db, tenant_id))
+    # A fresh reading clears any open "stale" alert for this sensor — and (if one
+    # was open) emails a BACK ONLINE recovery notice to the same recipients.
+    rec = recipients_for(db, tenant_id)
+    loc = sm.label if (sm and sm.label) else f"sensor {eui}"
+    _clear_alert(db, tenant_id, eui, "stale", rec, loc)
+    evaluate_reading(db, tenant_id, eui, probes, mx, rec)
     return {"ok": True, "eui": eui, "max_c": mx}
 
 
@@ -1101,7 +1125,7 @@ def ingest_crash(body: CrashBody, tenant_id: str = Depends(tenant_from_api_key),
 
 
 @app.get("/v1/crashes")
-def list_crashes(p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+def list_crashes(p: Principal = Depends(require_admin), db: Session = Depends(get_db)):
     rows = db.scalars(select(CrashReport).where(CrashReport.tenant_id == p.tenant_id)
                       .order_by(CrashReport.ts.desc()).limit(500)).all()
     return {"crashes": [{"id": c.id, "eui": c.eui, "ts": c.ts, "reset_reason": c.reset_reason,
@@ -1110,7 +1134,7 @@ def list_crashes(p: Principal = Depends(current_principal), db: Session = Depend
 
 
 @app.get("/v1/crashes/export.csv")
-def crashes_export(p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+def crashes_export(p: Principal = Depends(require_admin), db: Session = Depends(get_db)):
     names = _device_names(db, p.tenant_id)
     rows = db.scalars(select(CrashReport).where(CrashReport.tenant_id == p.tenant_id)
                       .order_by(CrashReport.ts.desc())).all()

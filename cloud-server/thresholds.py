@@ -90,7 +90,11 @@ def _open_alert(db: Session, tenant_id: str, alert_recipients,
             db.commit()
 
 
-def _clear_alert(db: Session, tenant_id: str, key: str, kind: str) -> None:
+def _clear_alert(db: Session, tenant_id: str, key: str, kind: str,
+                 recipients=None, location: str = "") -> None:
+    """Clear an open/acked alert. For an 'offline' (stale) alert, passing
+    `recipients` also sends a BACK-ONLINE recovery email (online/offline pairing).
+    Other kinds clear silently, as before."""
     existing = db.scalar(
         select(Alert).where(
             Alert.tenant_id == tenant_id, Alert.eui == key,
@@ -101,20 +105,31 @@ def _clear_alert(db: Session, tenant_id: str, key: str, kind: str) -> None:
         existing.state = "cleared"
         existing.cleared_at = now()
         db.commit()
+        if kind == "stale" and recipients is not None:
+            _dispatch(recipients, kind, location or existing.location, 0.0, 0.0,
+                      opened=False, recovered=True)
 
 
 def _dispatch(recipients, kind: str, location: str, value: float,
-              threshold: float, opened: bool) -> None:
-    """recipients: (emails: list[str], phones: list[str]) for the tenant."""
+              threshold: float, opened: bool, recovered: bool = False) -> None:
+    """recipients: (emails: list[str], phones: list[str]) for the tenant.
+    opened=new alert · recovered=back-to-normal (offline->online) · else a
+    reminder while the condition persists."""
     emails, phones = recipients
-    label = {"high_temp": "HIGH TEMPERATURE", "delta": "HIGH ΔT", "stale": "SENSOR OFFLINE"}.get(kind, kind)
-    verb = "ALERT" if opened else "REMINDER"
-    subject = f"[HVAC {verb}] {label} — {location}"
-    if kind == "stale":
-        body = f"{location} has stopped reporting.\nNo reading for over {config.STALE_AFTER_S:.0f}s."
+    if recovered:
+        # Only 'stale' (offline) currently sends a recovery/back-online notice.
+        subject = f"[HVAC RECOVERED] BACK ONLINE — {location}"
+        body = f"{location} is reporting again."
     else:
-        body = (f"{location}\n{label}: {value:.1f}°C "
-                f"(limit {threshold:.1f}°C).")
+        # 'stale' covers both sensors and routers, so keep the label generic.
+        label = {"high_temp": "HIGH TEMPERATURE", "delta": "HIGH ΔT", "stale": "OFFLINE"}.get(kind, kind)
+        verb = "ALERT" if opened else "REMINDER"
+        subject = f"[HVAC {verb}] {label} — {location}"
+        if kind == "stale":
+            body = f"{location} has stopped reporting.\nNo data for over {config.STALE_AFTER_S:.0f}s."
+        else:
+            body = (f"{location}\n{label}: {value:.1f}°C "
+                    f"(limit {threshold:.1f}°C).")
     notify_email(emails, subject, body)
     notify_sms(phones, f"{subject}\n{body}")
 
