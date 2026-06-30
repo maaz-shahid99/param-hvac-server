@@ -34,8 +34,8 @@ python display_node.py          # :8001   (local dashboard) — set DISCOVERY_UR
 ```
 
 ## Sibling repos
-- App: https://github.com/YOUR-ORG/hvac-mobile
-- Firmware: https://github.com/YOUR-ORG/hvac-firmware
-- Web: https://github.com/YOUR-ORG/hvac-web
+- App: https://github.com/maaz-shahid99/param-hvac-mobile
+- Firmware: https://github.com/maaz-shahid99/param-hvac-firmware
+- Web: https://github.com/maaz-shahid99/param-hvac-web
 
 Ops docs: [docs/](docs/) (deployment, setup, full-system test). Security: [SECURITY.md](SECURITY.md).
