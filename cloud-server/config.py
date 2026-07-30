@@ -73,6 +73,15 @@ FIRMWARE_DIR = os.path.abspath(
     os.environ.get("FIRMWARE_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "firmware"))
 )
 
+# --- Discovery legacy root paths (deployed-firmware compatibility) ---------
+# The discovery service is mounted at /discovery, but firmware provisioned BEFORE
+# the merge appends its paths to the root of whatever URL it was given (e.g.
+# POST /register/sensor, GET /discover) — which the standalone :8000 service used
+# to serve. With this enabled the same routes are ALSO served at the root, so
+# already-deployed gateways keep working with no reflash. Turn it off once every
+# unit runs firmware that derives <cloud>/discovery.
+DISCOVERY_LEGACY_ROOT = os.environ.get("DISCOVERY_LEGACY_ROOT", "1") not in ("", "0", "false", "False")
+
 # --- mDNS / Bonjour discovery ----------------------------------------------
 # Advertise a stable hostname on the LAN so the app/console/gateway can reach the
 # appliance by name (http://<MDNS_NAME>.local:PORT) instead of a hard IP. Best-

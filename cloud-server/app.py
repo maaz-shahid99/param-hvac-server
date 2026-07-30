@@ -387,6 +387,15 @@ app.add_middleware(
 # (Bridge.ino's deriveDiscoveryUrl()) instead of needing a separate host:port.
 app.include_router(discovery_routes.router, prefix="/discovery", tags=["discovery"])
 
+# ...and ALSO at the root, for gateways provisioned before the merge. Their
+# firmware appends "/register/sensor" / "/discover" to the bare URL it was given,
+# which is what the standalone :8000 service served — so without this a deployed
+# fleet 404s on every heartbeat and cannot be fixed without reflashing. Registered
+# here, ahead of the SPA catch-all at the bottom of this file, so these win.
+# Disable with DISCOVERY_LEGACY_ROOT=0 once no such firmware remains in the field.
+if config.DISCOVERY_LEGACY_ROOT:
+    app.include_router(discovery_routes.router, tags=["discovery (legacy root)"])
+
 
 # ---- per-IP rate limit for auth endpoints ---------------------------------- #
 # In-memory sliding window; mitigates password/OTP brute-force and registration
