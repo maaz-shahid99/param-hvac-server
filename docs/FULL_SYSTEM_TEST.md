@@ -24,24 +24,29 @@ SED sensor (C6)  --UDP ff03::2:1234-->  Commissioner C6  --UART-->  Bridge C3
 ---
 
 ## Stage 0 — Backend up (PC)
-Run all three (separate terminals). Cloud Server can be local now, AWS later.
+Two terminals — the Cloud Server now serves discovery itself at `/discovery`, so
+there's no separate discovery process to start. Cloud Server can be local now,
+AWS later.
 ```powershell
-cd "c:\Users\maazs\Documents\Projects\HVAC_v1.1\Discovery Server"
-conda run -n alpr_dev python discovery_server.py            # :8000
-conda run -n alpr_dev python display_node.py                # :8001  (LAN 3D dashboard)
-
-cd "c:\Users\maazs\Documents\Projects\HVAC_v1.1\Cloud Server"
+cd "<repo>\hvac-server\cloud-server"
 $env:BOOTSTRAP_TOKEN="dev-bootstrap"
 conda run -n alpr_dev python -m uvicorn app:app --host 0.0.0.0 --port 8002
-```
-**Marker:** `http://<PC-IP>:8001/` shows the 3D grid; `http://<PC-IP>:8002/health` returns `{"ok":true}`.
 
-> Firewall: allow inbound 8000/8001/8002 so the gateway and phone can reach the PC.
+cd "<repo>\hvac-server\discovery-server"
+conda run -n alpr_dev python display_node.py                # :8001  (LAN 3D dashboard)
+```
+**Marker:** `http://<PC-IP>:8001/` shows the 3D grid; `http://<PC-IP>:8002/health`
+returns `{"ok":true}`; `http://<PC-IP>:8002/discovery/status` returns the presence
+JSON (proves the merged discovery plane is live).
+
+> Firewall: allow inbound 8001/8002 so the gateway and phone can reach the PC.
+> (Only add 8000 if you deliberately run `discovery_server.py` standalone.)
 
 ## Stage 1 — Flash firmware
 - **Commissioner (C6)** — ESP‑IDF: `idf.py set-target esp32c6 && idf.py build flash monitor`.
 - **Bridge (C3)** — Arduino IDE, board **XIAO ESP32‑C3**, upload `Bridge.ino`.
-  (Set `DEFAULT_DISCOVERY_URL` if you don't provision `disc` from the app.)
+  (No URL to edit: discovery is derived from the `cloud` URL you provision in
+  Stage 3. `DEFAULT_DISCOVERY_URL` is intentionally empty.)
 - **Sensor** — Arduino IDE, board **ESP32‑C6/H2**, upload `SED_SENSOR_BARE.ino`.
   **Marker:** sensor serial prints `[HW] EUI-64: …` — **write this EUI down**, it's the
   device identity and what its QR encodes.
@@ -57,10 +62,12 @@ conda run -n alpr_dev python -m uvicorn app:app --host 0.0.0.0 --port 8002
 
 ## Stage 3 — Provision Wi‑Fi + cloud (one step)
 App → **Router Setup** dialog → enter SSID/pass, optionally Thread net name,
-`disc = http://<PC-IP>:8000`, `cloud = http://<PC-IP>:8002`, then tap **＋** on
-the Gateway API Key field to **mint a key** → **Provision**.
+`cloud = http://<PC-IP>:8002`, then tap **＋** on the Gateway API Key field to
+**mint a key** → **Provision**. **Leave `disc` blank** — the gateway derives
+`http://<PC-IP>:8002/discovery` from the cloud URL.
 - **C3 markers:** `STATUS CONNECTING_WIFI` → Wi‑Fi connected; on next boot/log
-  `[BOOT] Cloud alerting: http://<PC-IP>:8002 (key set)`.
+  `[BOOT] Cloud alerting: http://<PC-IP>:8002 (key set)` and
+  `[BOOT] Discovery server: http://<PC-IP>:8002/discovery` (the derived value).
 - **C6 marker:** forms the mesh (`FORM_NET`) and becomes **Leader** → C3 brings up
   Wi‑Fi + BLE (leadership‑gated).
 - **Backend marker:** `display_node` logs the gateway presence; discovery `/discover`

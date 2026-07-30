@@ -1,5 +1,19 @@
 # HVAC Discovery + Rack Monitor
 
+> **The discovery service now ships inside the cloud server by default.**
+> `cloud-server/discovery_routes.py` serves these same endpoints at
+> `<cloud_url>/discovery` on port **8002**, so a site runs one server on one port
+> and the gateway derives the discovery URL from the cloud URL — nothing extra to
+> provision. See [`../cloud-server/README.md`](../cloud-server/README.md).
+>
+> Running `discovery_server.py` standalone on `:8000`, as described below, is
+> still fully supported — use it when you want discovery on its own host/port
+> (then set the gateway's `disc` override to point at it). **Don't run both for
+> one site**, or sensors and the display node will register in two places.
+>
+> `display_node.py` (the `:8001` LAN dashboard) is independent of that choice and
+> is used with either deployment.
+
 Three cooperating pieces:
 
 ```
@@ -35,8 +49,12 @@ Three cooperating pieces:
 
 ## Quick start (all on one machine for testing)
 
+This runs discovery **standalone**; skip step 1 if you're using the merged
+`/discovery` endpoints on the cloud server instead (and point `--discovery` at
+`http://localhost:8002/discovery` in steps 2 and 3).
+
 ```bash
-cd Paramvidya/discovery
+cd discovery-server
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 

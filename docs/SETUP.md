@@ -19,8 +19,9 @@ its **own terminal** (they're long-running).
 | 1 | **Cloud Server** | `Cloud Server/` | **8002** | FastAPI product backend (auth, readings, alerts, env, crashes, OTA). Multi-tenant. | **Yes — the core.** |
 | 2 | **Web dashboard** | `web-dashboard/` | **5173** (dev) | React admin/member UI. In prod it's served *by* the Cloud Server at `:8002/`. | Yes (or use the served build) |
 | 3 | **Field console** | `field-console/` | **5174** (dev) | Manufacturer LAN service tool (support token, firmware/OTA). | Optional |
-| 4 | **Discovery server** | `Discovery Server/` | **8000** | LAN rendezvous + "site offline" email. Single-site, no accounts. | Optional (legacy path) |
-| 5 | **Display node** | `Discovery Server/` | **8001** | On-prem 3D LAN dashboard, ingests readings. | Optional (legacy path) |
+| 4 | **Discovery** | served by (1) at `/discovery` | **8002** | LAN rendezvous + "site offline" email. Single-site, no accounts. Included in the Cloud Server — nothing extra to start, and the gateway derives its URL from the cloud URL. | Included with (1) |
+| 4b | Discovery *standalone* | `discovery-server/` | **8000** | The same service as its own process, for sites that want it separate (set the gateway's `disc` override). Don't run alongside (4). | Optional |
+| 5 | **Display node** | `discovery-server/` | **8001** | On-prem 3D LAN dashboard, ingests readings. | Optional |
 | 6 | **Flutter app** | `thread_commissioner/` | — | Phone app: BLE commissioning + cloud monitoring. | When you have a device/emulator |
 
 The **Cloud Server (1)** + **web dashboard (2)** are all you need to exercise the
@@ -48,8 +49,9 @@ testing that path.
   cd field-console;  npm install; cd ..
   ```
 - **Flutter SDK** (only for the phone app): `flutter doctor` should be green.
-- **Firewall:** to reach these from a phone/another box, allow inbound **8000–8002**
-  (and **5173/5174** if serving the dev UIs to other machines).
+- **Firewall:** to reach these from a phone/another box, allow inbound **8002**
+  (plus **8001** for the display node, and **8000** only if you run discovery
+  standalone; and **5173/5174** if serving the dev UIs to other machines).
 
 > **Heads-up on email:** `Cloud Server/.env` is auto-loaded and currently holds live
 > Gmail SMTP creds. **Any alert you trip while the server runs will send a real
@@ -117,17 +119,23 @@ Firmware/OTA publish.
 Only if you're testing the single-site discovery/display stack (the gateway can
 post to the display node for its 3D dashboard).
 
-**Terminal C — discovery server (`:8000`):**
+**Terminal C — discovery server (`:8000`) — usually SKIP this:**
+Discovery already runs inside the Cloud Server from Terminal A at
+`:8002/discovery`. Start this only if you want discovery standalone on its own
+port (then set the gateway's `disc` override to it, and don't run both).
 ```powershell
 conda activate alpr_dev
-cd "c:\Users\maazs\Documents\Projects\HVAC_v1.1\Discovery Server"
+cd "<repo>\hvac-server\discovery-server"
 python discovery_server.py
 ```
 
 **Terminal D — display node (`:8001`):**
 ```powershell
-cd "c:\Users\maazs\Documents\Projects\HVAC_v1.1\Discovery Server"
-python display_node.py --discovery http://localhost:8000
+cd "<repo>\hvac-server\discovery-server"
+# against the merged service (default):
+python display_node.py --discovery http://localhost:8002/discovery
+# ...or against a standalone discovery server from Terminal C:
+#   python display_node.py --discovery http://localhost:8000
 # ...or ingest from a real board on serial instead of HTTP:
 # python display_node.py --serial COM5 --baud 115200
 ```
