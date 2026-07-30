@@ -8,12 +8,18 @@ The Python backends for the HVAC monitoring system. Two independent services.
 ## Services
 | Path | Framework | Port | Role |
 |---|---|---|---|
-| [cloud-server/](cloud-server/) | FastAPI + SQLAlchemy | **8002** | Multi-tenant cloud: ingest, JWT auth, threshold alerts (email/SMS), OTA, support plane |
-| [discovery-server/](discovery-server/) | FastAPI | **8000** (+ display node **8001**) | LAN device discovery + on-prem live dashboard (`display_node.py`) |
+| [cloud-server/](cloud-server/) | FastAPI + SQLAlchemy | **8002** | Multi-tenant cloud: ingest, JWT auth, threshold alerts (email/SMS), OTA, support plane — **plus discovery at `/discovery`** |
+| [discovery-server/](discovery-server/) | FastAPI | **8000** (+ display node **8001**) | Standalone LAN device discovery + on-prem live dashboard (`display_node.py`) |
 
-The two services do **not** import each other — they deploy independently. Cloud Server
-is the backend for `hvac-mobile` and `hvac-web`; the discovery server is the optional
-on-prem path.
+Cloud Server is the backend for `hvac-mobile` and `hvac-web`.
+
+**Discovery runs in one of two places.** By default it's *merged into* cloud-server at
+`/discovery` ([cloud-server/discovery_routes.py](cloud-server/discovery_routes.py)), so a
+site runs **one server on one port** and the gateway only needs the cloud URL — it derives
+`<cloud_url>/discovery` itself (see `deriveDiscoveryUrl()` in the firmware's `Bridge.ino`).
+Running [discovery-server/](discovery-server/) as its own process on :8000 still works and
+is unchanged — point the gateway's `disc` override at it. Don't run both for one site.
+`display_node.py` (:8001, the on-prem dashboard) is independent either way.
 
 ## Quick start (cloud-server)
 ```bash

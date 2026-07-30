@@ -38,6 +38,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 import config
+import discovery_routes
 from auth import (
     Principal,
     SupportPrincipal,
@@ -305,7 +306,6 @@ def _scan_stale() -> None:
 # App                                                                          #
 # --------------------------------------------------------------------------- #
 
-@asynccontextmanager
 def _lan_ip() -> str:
     """Best-effort primary LAN IP (no traffic actually sent)."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -361,15 +361,19 @@ def _mdns_stop(app: FastAPI) -> None:
         pass
 
 
+@asynccontextmanager
 async def lifespan(app: FastAPI):
     config.validate_startup()   # fail fast on insecure onprem/prod config (no-op in dev)
     init_db()
+    discovery_routes.discovery_init_db()
     await _mdns_start(app)
     task = asyncio.create_task(stale_watchdog())
+    discovery_task = asyncio.create_task(discovery_routes.discovery_watchdog())
     try:
         yield
     finally:
         task.cancel()
+        discovery_task.cancel()
         _mdns_stop(app)
 
 
@@ -378,6 +382,10 @@ app.add_middleware(
     CORSMiddleware, allow_origins=config.CORS_ORIGINS,
     allow_methods=["*"], allow_headers=["*"],
 )
+# Discovery/rendezvous service, merged onto this same port at /discovery — see
+# discovery_routes.py. Firmware derives "<cloud_url>/discovery" automatically
+# (Bridge.ino's deriveDiscoveryUrl()) instead of needing a separate host:port.
+app.include_router(discovery_routes.router, prefix="/discovery", tags=["discovery"])
 
 
 # ---- per-IP rate limit for auth endpoints ---------------------------------- #
