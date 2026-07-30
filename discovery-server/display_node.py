@@ -62,6 +62,7 @@ DISCOVERY_URL = os.environ.get("DISCOVERY_URL", "http://localhost:8000")
 ANNOUNCE_INTERVAL = float(os.environ.get("ANNOUNCE_INTERVAL", "5"))
 LONG_POLL_TIMEOUT = float(os.environ.get("LONG_POLL_TIMEOUT", "25"))
 DB_PATH = os.environ.get("NODE_DB", os.path.join(HERE, "node.db"))
+MAP_RELOAD_INTERVAL = float(os.environ.get("MAP_RELOAD_INTERVAL", "240"))  # seconds
 
 NUM_BOXES = int(os.environ.get("NUM_BOXES", "12"))
 DEFAULT_PROBES = int(os.environ.get("DEFAULT_PROBES", "8"))
@@ -313,6 +314,12 @@ async def announce_loop() -> None:
             await asyncio.sleep(ANNOUNCE_INTERVAL)
 
 
+async def map_reload_loop() -> None:
+    while True:
+        await asyncio.sleep(MAP_RELOAD_INTERVAL)
+        load_map()
+
+
 # --------------------------------------------------------------------------- #
 # FastAPI app                                                                  #
 # --------------------------------------------------------------------------- #
@@ -341,7 +348,10 @@ async def lifespan(app: FastAPI):
     init_db()
     load_map()
     broker.bind_loop(asyncio.get_running_loop())
-    tasks = [asyncio.create_task(announce_loop())]
+    tasks = [
+        asyncio.create_task(announce_loop()),
+        asyncio.create_task(map_reload_loop()),
+    ]
     if SERIAL_PORT:
         threading.Thread(
             target=serial_reader_thread,
