@@ -1141,13 +1141,56 @@ def ingest_crash(body: CrashBody, tenant_id: str = Depends(tenant_from_api_key),
     return {"ok": True, "eui": eui}
 
 
+# A device re-uploads the SAME crash every 20s until it gives up (6 tries), because
+# the C3 counts attempts, not confirmed deliveries — so one panic lands as ~6 rows.
+# Collapse identical consecutive reports into a single entry carrying `occurrences`,
+# so the count reflects real crashes instead of retry noise. Purely a read-side view:
+# every row is still stored, and the CSV export stays raw for forensics.
+CRASH_DEDUP_WINDOW_S = 300.0
+
+
 @app.get("/v1/crashes")
-def list_crashes(p: Principal = Depends(require_admin), db: Session = Depends(get_db)):
+def list_crashes(p: Principal = Depends(require_admin), db: Session = Depends(get_db),
+                 raw: bool = False):
     rows = db.scalars(select(CrashReport).where(CrashReport.tenant_id == p.tenant_id)
-                      .order_by(CrashReport.ts.desc()).limit(500)).all()
-    return {"crashes": [{"id": c.id, "eui": c.eui, "ts": c.ts, "reset_reason": c.reset_reason,
-                         "fw": c.fw, "pc": c.pc, "backtrace": c.backtrace, "detail": c.detail}
-                        for c in rows]}
+                      .order_by(CrashReport.ts.desc()).limit(2000)).all()
+
+    def rec(c: CrashReport) -> dict:
+        return {"id": c.id, "eui": c.eui, "ts": c.ts, "reset_reason": c.reset_reason,
+                "fw": c.fw, "pc": c.pc, "backtrace": c.backtrace, "detail": c.detail}
+
+    if raw:
+        return {"crashes": [rec(c) for c in rows[:500]]}
+
+    out: list[dict] = []
+    for c in rows:                       # newest -> oldest
+        sig = (c.eui, c.reset_reason, c.pc, c.backtrace)
+        if out and out[-1]["_sig"] == sig and abs(out[-1]["first_ts"] - c.ts) <= CRASH_DEDUP_WINDOW_S:
+            out[-1]["occurrences"] += 1
+            out[-1]["first_ts"] = c.ts   # rows descend, so this walks back to the earliest retry
+            continue
+        e = rec(c)
+        e["occurrences"] = 1
+        e["first_ts"] = c.ts
+        e["_sig"] = sig
+        out.append(e)
+        if len(out) >= 500:
+            break
+    for e in out:
+        e.pop("_sig", None)
+    return {"crashes": out}
+
+
+@app.get("/v1/fleet")
+def fleet_status(p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    """Gateway self-report (firmware versions, free heap, role) that arrives with the
+    30s mesh push. Surfaced so a customer can watch heap headroom — a heap that
+    sawtooths down before each panic is the signature of a leak in the gateway."""
+    fs = db.get(FleetStatus, p.tenant_id)
+    if not fs:
+        return {"fleet": None}
+    return {"fleet": {"fw_c3": fs.fw_c3, "fw_c6": fs.fw_c6, "heap_free": fs.heap_free,
+                      "role": fs.role, "updated_at": fs.updated_at}}
 
 
 @app.get("/v1/crashes/export.csv")
