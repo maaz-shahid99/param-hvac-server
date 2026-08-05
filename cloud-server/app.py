@@ -549,6 +549,17 @@ def _get_member(db: Session, p: Principal, member_id: str) -> User:
     return u
 
 
+def _active_admins(db: Session, tenant_id: str) -> int:
+    """How many active admins the org has. An org with zero admins is stranded:
+    nobody can approve join requests, edit thresholds, mint a gateway key or read
+    crash reports — and there's no self-service way back. Every path that could
+    remove an admin has to check this first."""
+    return len(db.scalars(
+        select(User).where(User.tenant_id == tenant_id,
+                           User.role == "admin", User.status == "active")
+    ).all())
+
+
 @app.post("/v1/members/{member_id}/approve")
 def approve_member(member_id: str, p: Principal = Depends(require_admin),
                    db: Session = Depends(get_db)):
@@ -591,9 +602,39 @@ def set_member_notifications(member_id: str, body: MemberNotifyBody,
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Member has no phone number")
         u.sms_enabled = body.sms_enabled
     if body.role in ("admin", "member"):
+        # Refuse to demote the last admin — that would strand the org with nobody
+        # able to administer it, including whoever is making this call.
+        if (u.role == "admin" and body.role == "member"
+                and u.status == "active" and _active_admins(db, p.tenant_id) <= 1):
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "This is the only admin — promote another member to admin first.",
+            )
         u.role = body.role
     db.commit()
     return {"ok": True, "member": _member_dict(u)}
+
+
+@app.post("/v1/members/me/leave")
+def leave_org(p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    """Remove yourself from the organization. Deletes the account, so the org's
+    roster and alert recipients no longer include you; rejoining later is the
+    normal join-by-org-code flow.
+
+    Blocked for the last remaining admin — see _active_admins()."""
+    u = db.get(User, p.user_id)
+    if not u:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "User not found")
+    if u.role == "admin" and u.status == "active" and _active_admins(db, u.tenant_id) <= 1:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "You are the only admin — promote another member to admin before leaving.",
+        )
+    email = u.email
+    db.delete(u)
+    db.execute(delete(PasswordReset).where(PasswordReset.email == email))
+    db.commit()
+    return {"ok": True}
 
 
 # ---- password reset (email OTP) -------------------------------------------- #
