@@ -21,6 +21,13 @@ def _load_dotenv() -> None:
             raw = fh.read()
     except OSError:
         return
+    # Keys this file has already set, so a LATER line in the file can override an
+    # EARLIER one while a real environment variable still wins over the file
+    # entirely. Without this the check below was first-wins within the file too:
+    # appending `SMTP_HOST=smtp.gmail.com` to a file that already carried a blank
+    # `SMTP_HOST=` from the template did nothing at all, silently, because the
+    # blank line had already put the key in os.environ.
+    from_file: set[str] = set()
     for line in raw.splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
@@ -40,8 +47,9 @@ def _load_dotenv() -> None:
             val = ""
         elif " #" in val:
             val = val.split(" #", 1)[0].strip()   # strip a trailing "  # comment"
-        if key and key not in os.environ:
+        if key and (key not in os.environ or key in from_file):
             os.environ[key] = val
+            from_file.add(key)
 
 
 _load_dotenv()
