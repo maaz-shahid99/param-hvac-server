@@ -89,6 +89,11 @@ def notify_email(to: list[str], subject: str, body: str) -> None:
     """Best-effort send via SES, then SMTP, then log. Never raises."""
     recipients = [r.strip() for r in to if r and r.strip()]
     if not recipients:
+        # Say so. An org can genuinely end up with nobody opted in — an admin
+        # who was the only recipient leaves or is removed, and the remaining
+        # members all have email_enabled=false. Returning quietly meant the
+        # alert fired, was stored, and vanished with no trace anywhere.
+        print(f"[email:no-recipients] {subject} -> nobody is opted in to receive alerts")
         return
     if _send_ses(recipients, subject, body):
         return
