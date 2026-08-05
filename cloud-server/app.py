@@ -639,6 +639,50 @@ def reject_member(member_id: str, background: BackgroundTasks,
     return {"ok": True, "member": _member_dict(u)}
 
 
+@app.delete("/v1/members/{member_id}")
+def remove_member(member_id: str, background: BackgroundTasks,
+                  p: Principal = Depends(require_admin),
+                  db: Session = Depends(get_db)):
+    """Remove someone from the organization.
+
+    An admin could previously only REJECT a pending request; there was no way to
+    remove a member who had already been approved — someone who left the company
+    kept their login and kept receiving alerts indefinitely.
+
+    Deletes the account rather than marking it rejected, matching
+    /v1/members/me/leave. That matters: /v1/auth/join refuses an email that
+    already exists, so a 'rejected' row would permanently block that address from
+    ever rejoining, even by invitation."""
+    u = _get_member(db, p, member_id)
+    if u.id == p.user_id:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "You can't remove yourself — use Leave organization instead.",
+        )
+    # Same guard as demote and leave: never strand the org without an admin.
+    if u.role == "admin" and u.status == "active" and _active_admins(db, p.tenant_id) <= 1:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "This is the only admin — promote another member to admin first.",
+        )
+    email, name = u.email, (u.name or u.email)
+    was_active = u.status == "active"
+    db.delete(u)
+    db.execute(delete(PasswordReset).where(PasswordReset.email == email))
+    db.commit()
+    if was_active and email:
+        t = db.get(Tenant, p.tenant_id)
+        org = t.name if t else "the organization"
+        background.add_task(
+            notify_email, [email],
+            f"You've been removed from {org}",
+            f"An admin removed your account from {org} on HVAC Monitor.\n\n"
+            f"You can no longer sign in and will stop receiving alerts. "
+            f"If this is unexpected, contact them directly.",
+        )
+    return {"ok": True, "removed": name}
+
+
 class MemberNotifyBody(BaseModel):
     email_enabled: bool | None = None
     sms_enabled: bool | None = None
