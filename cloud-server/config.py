@@ -29,6 +29,15 @@ def _load_dotenv() -> None:
         key, val = key.strip(), val.strip()
         if len(val) >= 2 and val[0] in "\"'" and val[-1] == val[0]:
             val = val[1:-1]                       # quoted -> take verbatim
+        elif val.startswith("#"):
+            # An EMPTY setting that carries an inline comment, e.g.
+            #     SES_FROM=            # empty => fall through to SMTP
+            # `val.strip()` above removes the leading spaces, so the " #" test
+            # below never matched and the comment itself became the value. That
+            # made blank-but-documented settings read as configured: SES_FROM
+            # ended up truthy, so every alert attempted a doomed SES send before
+            # falling through to the log.
+            val = ""
         elif " #" in val:
             val = val.split(" #", 1)[0].strip()   # strip a trailing "  # comment"
         if key and key not in os.environ:
