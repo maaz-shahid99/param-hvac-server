@@ -1331,6 +1331,26 @@ class RecipientsBody(BaseModel):
     alert_phones: str = ""
 
 
+@app.get("/v1/recipients")
+def get_recipients(p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    """The extra alert addresses on the tenant, so a client can EDIT them instead
+    of overwriting blind.
+
+    There was no read endpoint at all, which is why the dashboard's editor opened
+    empty every time: submitting it replaced the whole list with whatever was in
+    the box, silently deleting every configured alert email. Also reports the
+    opted-in members, so the UI can show who actually gets notified."""
+    t = db.get(Tenant, p.tenant_id)
+    emails, phones = recipients_for(db, p.tenant_id)
+    return {
+        "alert_emails": (t.alert_emails or "") if t else "",
+        "alert_phones": (t.alert_phones or "") if t else "",
+        # The full effective set = opted-in members + the extras above.
+        "effective_emails": emails,
+        "effective_phones": phones,
+    }
+
+
 @app.put("/v1/recipients")
 def set_recipients(body: RecipientsBody, p: Principal = Depends(require_admin),
                    db: Session = Depends(get_db)):
@@ -1338,6 +1358,71 @@ def set_recipients(body: RecipientsBody, p: Principal = Depends(require_admin),
     t.alert_emails, t.alert_phones = body.alert_emails, body.alert_phones
     db.commit()
     return {"ok": True}
+
+
+# ---- notification delivery (is alerting actually reaching anyone?) --------- #
+
+def _delivery_channels() -> dict:
+    """Which channel notify_email/notify_sms will actually use.
+
+    Delivery falls through SES -> SMTP -> log, and notify_email NEVER raises. So
+    an appliance with no mail configured looks completely healthy while every
+    alert it 'sends' is only printed to a log file. Exposing this lets the
+    dashboard say so out loud. Never returns the password."""
+    if config.SES_FROM:
+        email = "ses"
+    elif config.SMTP_HOST:
+        email = "smtp"
+    else:
+        email = "log-only"
+    if config.SNS_SMS_ENABLED:
+        sms = "sns"
+    elif config.TWILIO_ACCOUNT_SID and config.TWILIO_FROM:
+        sms = "twilio"
+    else:
+        sms = "log-only"
+    return {
+        "email": email,
+        "email_configured": email != "log-only",
+        "email_from": config.MAIL_FROM,
+        "smtp_host": config.SMTP_HOST or "",
+        "sms": sms,
+        "sms_configured": sms != "log-only",
+    }
+
+
+@app.get("/v1/notifications/status")
+def notifications_status(p: Principal = Depends(require_admin)):
+    """Admin-visible delivery status, so 'alerts are configured' can be verified
+    instead of assumed."""
+    return _delivery_channels()
+
+
+@app.post("/v1/notifications/test")
+def notifications_test(p: Principal = Depends(require_admin), db: Session = Depends(get_db)):
+    """Send a test alert to the calling admin's own address and report what
+    happened — a one-click check that beats waiting for a real overheat to
+    discover the mail path was never working."""
+    u = db.get(User, p.user_id)
+    if not u or not u.email:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Your account has no email address.")
+    ch = _delivery_channels()
+    if not ch["email_configured"]:
+        # Be explicit rather than returning ok:true for a message that only got
+        # written to a log file.
+        return {
+            "ok": False,
+            "channel": "log-only",
+            "detail": "No SES_FROM and no SMTP_HOST configured — the test was written to the "
+                      "server log instead of being emailed. Alerts are not reaching anyone.",
+        }
+    notify_email(
+        [u.email],
+        "HVAC Monitor test alert",
+        "This is a test from your HVAC Monitor dashboard.\n\n"
+        "If you received it, alert delivery is working.",
+    )
+    return {"ok": True, "channel": ch["email"], "sent_to": u.email, "detail": "Test email dispatched."}
 
 
 # --------------------------------------------------------------------------- #
