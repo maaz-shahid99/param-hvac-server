@@ -29,7 +29,7 @@ from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -476,7 +476,7 @@ def register(body: RegisterBody, db: Session = Depends(get_db),
 
 
 @app.post("/v1/auth/join")
-def join(body: JoinBody, db: Session = Depends(get_db),
+def join(body: JoinBody, background: BackgroundTasks, db: Session = Depends(get_db),
          _rl: None = Depends(rate_limit)):
     """Register as a MEMBER of an existing org (by org code). The member starts
     'pending' — an admin must approve before they receive notifications."""
@@ -494,6 +494,23 @@ def join(body: JoinBody, db: Session = Depends(get_db),
                 email_enabled=False, sms_enabled=False)
     db.add(user)
     db.commit()
+
+    # Tell the admins somebody is waiting. Without this a request sat in the
+    # database until an admin happened to open the Members page — there is no
+    # badge and the alert bell only counts temperature alerts, so a Friday
+    # request could go unnoticed all weekend while the applicant assumed the
+    # system was broken. Queued in the background so a slow SMTP handshake
+    # doesn't hold up the applicant's response.
+    admins = _admin_emails(db, tenant.id)
+    if admins:
+        who = f"{body.name} ({user.email})" if body.name else user.email
+        background.add_task(
+            notify_email, admins,
+            f"[{tenant.name}] {who} requested to join",
+            f"{who} has asked to join {tenant.name} on HVAC Monitor.\n\n"
+            f"They cannot sign in or receive alerts until an admin approves them.\n"
+            f"Approve or reject them on the Members page of the dashboard.",
+        )
     return _auth_payload(db, user)
 
 
@@ -549,6 +566,20 @@ def _get_member(db: Session, p: Principal, member_id: str) -> User:
     return u
 
 
+def _admin_emails(db: Session, tenant_id: str) -> list[str]:
+    """Emails of the ACTIVE admins for account notices (join requests, etc.).
+
+    Deliberately ignores `email_enabled`: that flag governs temperature ALERTS.
+    An admin who opted out of overheat emails still has to hear that somebody is
+    waiting on them for access — otherwise a request sits unseen indefinitely,
+    which is exactly what happened before this existed."""
+    rows = db.scalars(
+        select(User).where(User.tenant_id == tenant_id,
+                           User.role == "admin", User.status == "active")
+    ).all()
+    return [u.email for u in rows if u.email]
+
+
 def _active_admins(db: Session, tenant_id: str) -> int:
     """How many active admins the org has. An org with zero admins is stranded:
     nobody can approve join requests, edit thresholds, mint a gateway key or read
@@ -561,25 +592,95 @@ def _active_admins(db: Session, tenant_id: str) -> int:
 
 
 @app.post("/v1/members/{member_id}/approve")
-def approve_member(member_id: str, p: Principal = Depends(require_admin),
+def approve_member(member_id: str, background: BackgroundTasks,
+                   p: Principal = Depends(require_admin),
                    db: Session = Depends(get_db)):
     u = _get_member(db, p, member_id)
+    was_pending = u.status == "pending"
     u.status = "active"
     db.commit()
+    # Close the loop with the applicant, who is otherwise refreshing a "waiting
+    # for approval" screen with no way to tell whether anyone has looked.
+    if was_pending and u.email:
+        t = db.get(Tenant, p.tenant_id)
+        org = t.name if t else "your organization"
+        background.add_task(
+            notify_email, [u.email],
+            f"You've been approved for {org}",
+            f"An admin approved your request to join {org} on HVAC Monitor.\n\n"
+            f"You can sign in now. An admin controls whether you receive email or "
+            f"SMS alerts, so ask them to switch those on if you need them.",
+        )
     return {"ok": True, "member": _member_dict(u)}
 
 
 @app.post("/v1/members/{member_id}/reject")
-def reject_member(member_id: str, p: Principal = Depends(require_admin),
+def reject_member(member_id: str, background: BackgroundTasks,
+                  p: Principal = Depends(require_admin),
                   db: Session = Depends(get_db)):
     u = _get_member(db, p, member_id)
     if u.id == p.user_id:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "You can't reject yourself")
+    was_pending = u.status == "pending"
     u.status = "rejected"
     u.email_enabled = False
     u.sms_enabled = False
     db.commit()
+    # Say so rather than leaving them on a screen that waits forever.
+    if was_pending and u.email:
+        t = db.get(Tenant, p.tenant_id)
+        org = t.name if t else "the organization"
+        background.add_task(
+            notify_email, [u.email],
+            f"Your request to join {org} was declined",
+            f"An admin declined your request to join {org} on HVAC Monitor.\n\n"
+            f"If you think this is a mistake, contact them directly.",
+        )
     return {"ok": True, "member": _member_dict(u)}
+
+
+@app.delete("/v1/members/{member_id}")
+def remove_member(member_id: str, background: BackgroundTasks,
+                  p: Principal = Depends(require_admin),
+                  db: Session = Depends(get_db)):
+    """Remove someone from the organization.
+
+    An admin could previously only REJECT a pending request; there was no way to
+    remove a member who had already been approved — someone who left the company
+    kept their login and kept receiving alerts indefinitely.
+
+    Deletes the account rather than marking it rejected, matching
+    /v1/members/me/leave. That matters: /v1/auth/join refuses an email that
+    already exists, so a 'rejected' row would permanently block that address from
+    ever rejoining, even by invitation."""
+    u = _get_member(db, p, member_id)
+    if u.id == p.user_id:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "You can't remove yourself — use Leave organization instead.",
+        )
+    # Same guard as demote and leave: never strand the org without an admin.
+    if u.role == "admin" and u.status == "active" and _active_admins(db, p.tenant_id) <= 1:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "This is the only admin — promote another member to admin first.",
+        )
+    email, name = u.email, (u.name or u.email)
+    was_active = u.status == "active"
+    db.delete(u)
+    db.execute(delete(PasswordReset).where(PasswordReset.email == email))
+    db.commit()
+    if was_active and email:
+        t = db.get(Tenant, p.tenant_id)
+        org = t.name if t else "the organization"
+        background.add_task(
+            notify_email, [email],
+            f"You've been removed from {org}",
+            f"An admin removed your account from {org} on HVAC Monitor.\n\n"
+            f"You can no longer sign in and will stop receiving alerts. "
+            f"If this is unexpected, contact them directly.",
+        )
+    return {"ok": True, "removed": name}
 
 
 class MemberNotifyBody(BaseModel):
@@ -762,9 +863,39 @@ def create_api_key(body: ApiKeyBody, p: Principal = Depends(require_admin),
 
 @app.get("/v1/apikeys")
 def list_api_keys(p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    # `id` is needed so a key can be revoked; the raw key is never recoverable
+    # (only its hash is stored), so exposing the id leaks nothing.
     rows = db.scalars(select(ApiKey).where(ApiKey.tenant_id == p.tenant_id)).all()
-    return {"keys": [{"label": k.label, "created_at": k.created_at,
+    return {"keys": [{"id": k.id, "label": k.label, "created_at": k.created_at,
                       "last_used_at": k.last_used_at} for k in rows]}
+
+
+@app.delete("/v1/apikeys/{key_id}")
+def delete_api_key(key_id: str, p: Principal = Depends(require_admin),
+                   db: Session = Depends(get_db)):
+    """Revoke a key. There was no way to remove one, so a mis-clicked "Gateway
+    API key" button left an extra key on the tenant forever — and a leaked key
+    could never be withdrawn.
+
+    Refuses to delete the LAST key that a gateway is actively using: that would
+    cut the uplink, and the gateway holds the raw key in NVS, so it cannot be
+    re-provisioned without physical BLE access."""
+    k = db.get(ApiKey, key_id)
+    if not k or k.tenant_id != p.tenant_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Key not found")
+    recently_used = (k.last_used_at or 0) > now() - 900   # 15 min
+    others = db.scalars(select(ApiKey).where(ApiKey.tenant_id == p.tenant_id,
+                                             ApiKey.id != key_id)).all()
+    if recently_used and not others:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "This key is in active use by a gateway and is the only one left. "
+            "Deleting it would stop the gateway reporting, and it cannot be "
+            "re-provisioned without physical access to the device.",
+        )
+    db.delete(k)
+    db.commit()
+    return {"ok": True}
 
 
 # ---- ingest (gateway -> cloud) --------------------------------------------- #
