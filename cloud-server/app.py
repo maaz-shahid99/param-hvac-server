@@ -1296,6 +1296,116 @@ def env_export(p: Principal = Depends(current_principal), db: Session = Depends(
                     headers={"Content-Disposition": "attachment; filename=routers_env.csv"})
 
 
+# Bound the history scan. At the fleet's 60s cadence this is years of data for a
+# small site; it exists so a hand-typed `hours=168` on a big tenant can't pin the
+# box parsing JSON. Truncation is reported in the response, never silent.
+SERIES_MAX_ROWS = 200_000
+
+
+@app.get("/v1/readings/series")
+def readings_series(p: Principal = Depends(current_principal), db: Session = Depends(get_db),
+                    hours: float = 6.0, points: int = 120):
+    """Bucketed intake / exhaust / ΔT history per rack unit, for the dashboard's
+    trend chart.
+
+    The aggregation is deliberately identical to thresholds._evaluate_delta:
+    intake is slot 'A', exhaust is slot 'B', each side reduces by MAX across its
+    probes, and delta is exhaust-minus-intake only when BOTH sides have a value.
+    If this diverged, the graph would contradict the alert history it's meant to
+    explain — the same class of bug as the dashboard colouring against the wrong
+    threshold.
+    """
+    hours = max(0.05, min(float(hours or 6.0), 168.0))     # 3 minutes .. 7 days
+    points = max(10, min(int(points or 120), 500))
+    end = now()
+    start = end - hours * 3600.0
+    bucket_s = (end - start) / points
+
+    # unit_id -> {"label", "A": {(eui, rom)}, "B": {(eui, rom)}}
+    units: dict[str, dict] = {}
+    for sm in db.scalars(select(SensorMap).where(SensorMap.tenant_id == p.tenant_id)).all():
+        if not sm.unit_id:
+            continue                       # unmapped-to-a-unit probes have no ΔT
+        u = units.setdefault(sm.unit_id, {"label": "", "A": set(), "B": set()})
+        # "Rack / Unit / Port" -> "Rack / Unit", matching thresholds._unit_label.
+        if not u["label"] and sm.label:
+            parts = [s.strip() for s in sm.label.split("/")]
+            u["label"] = " / ".join(parts[:2]) if len(parts) >= 2 else sm.label
+        u["A" if sm.slot == "A" else "B"].add((sm.eui, sm.probe_rom))
+
+    if not units:
+        return {"start": start, "end": end, "bucket_s": bucket_s, "truncated": False, "units": []}
+
+    euis = {eui for u in units.values() for side in ("A", "B") for eui, _ in u[side]}
+
+    # (eui, rom) -> [(unit_id, side)]. Walking this per PROBE keeps the hot loop
+    # proportional to the readings, not to readings x units.
+    owner: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    for uid, u in units.items():
+        for side in ("A", "B"):
+            for key in u[side]:
+                owner.setdefault(key, []).append((uid, side))
+
+    # buckets[unit_id][bucket_index] = {"A": max_seen, "B": max_seen}
+    buckets: dict[str, dict[int, dict[str, float]]] = {uid: {} for uid in units}
+    q = (select(Reading)
+         .where(Reading.tenant_id == p.tenant_id, Reading.ts >= start, Reading.ts <= end,
+                Reading.eui.in_(euis))
+         .order_by(Reading.ts.asc())
+         .limit(SERIES_MAX_ROWS + 1))       # covered by ix_reading_tenant_ts
+    rows = db.scalars(q).all()
+    truncated = len(rows) > SERIES_MAX_ROWS
+    if truncated:
+        rows = rows[:SERIES_MAX_ROWS]
+
+    for r in rows:
+        try:
+            probes = json.loads(r.probes)
+        except (ValueError, TypeError):
+            continue
+        # Key by (eui, rom): a DS18B20 ROM is only unique within its own bus, so
+        # two nodes can legitimately present the same rom string.
+        temp_by_key: dict[tuple[str, str], float] = {}
+        for pr in probes:
+            if not isinstance(pr, dict) or not pr.get("rom") or pr.get("c") is None:
+                continue
+            try:
+                temp_by_key[(r.eui, pr["rom"])] = float(pr["c"])
+            except (TypeError, ValueError):
+                continue          # a malformed sample must not abort the window
+        if not temp_by_key:
+            continue
+        idx = max(0, min(int((r.ts - start) / bucket_s), points - 1))
+        for key, c in temp_by_key.items():
+            for uid, side in owner.get(key, ()):
+                sb = buckets[uid].setdefault(idx, {})
+                # MAX across the side's probes, matching thresholds._hottest.
+                if side not in sb or c > sb[side]:
+                    sb[side] = c
+
+    out = []
+    for uid, u in units.items():
+        pts = []
+        for idx in sorted(buckets[uid]):
+            b = buckets[uid][idx]
+            intake, exhaust = b.get("A"), b.get("B")
+            pts.append({
+                "t": round(start + (idx + 0.5) * bucket_s, 1),
+                "intake": None if intake is None else round(intake, 2),
+                "exhaust": None if exhaust is None else round(exhaust, 2),
+                # Never derive a ΔT from one side — a missing intake must read as
+                # "unknown", not as a delta measured against zero.
+                "delta": None if (intake is None or exhaust is None) else round(exhaust - intake, 2),
+            })
+        if pts:
+            out.append({"unit_id": uid, "label": u["label"] or "unit",
+                        "has_intake": bool(u["A"]), "has_exhaust": bool(u["B"]), "points": pts})
+
+    out.sort(key=lambda x: x["label"])
+    return {"start": start, "end": end, "bucket_s": bucket_s,
+            "truncated": truncated, "units": out}
+
+
 @app.get("/v1/readings/export.csv")
 def readings_export(p: Principal = Depends(current_principal), db: Session = Depends(get_db),
                     start: float | None = None, end: float | None = None):
