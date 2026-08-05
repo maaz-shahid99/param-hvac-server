@@ -387,6 +387,15 @@ app.add_middleware(
 # (Bridge.ino's deriveDiscoveryUrl()) instead of needing a separate host:port.
 app.include_router(discovery_routes.router, prefix="/discovery", tags=["discovery"])
 
+# ...and ALSO at the root, for gateways provisioned before the merge. Their
+# firmware appends "/register/sensor" / "/discover" to the bare URL it was given,
+# which is what the standalone :8000 service served — so without this a deployed
+# fleet 404s on every heartbeat and cannot be fixed without reflashing. Registered
+# here, ahead of the SPA catch-all at the bottom of this file, so these win.
+# Disable with DISCOVERY_LEGACY_ROOT=0 once no such firmware remains in the field.
+if config.DISCOVERY_LEGACY_ROOT:
+    app.include_router(discovery_routes.router, tags=["discovery (legacy root)"])
+
 
 # ---- per-IP rate limit for auth endpoints ---------------------------------- #
 # In-memory sliding window; mitigates password/OTP brute-force and registration
@@ -540,6 +549,17 @@ def _get_member(db: Session, p: Principal, member_id: str) -> User:
     return u
 
 
+def _active_admins(db: Session, tenant_id: str) -> int:
+    """How many active admins the org has. An org with zero admins is stranded:
+    nobody can approve join requests, edit thresholds, mint a gateway key or read
+    crash reports — and there's no self-service way back. Every path that could
+    remove an admin has to check this first."""
+    return len(db.scalars(
+        select(User).where(User.tenant_id == tenant_id,
+                           User.role == "admin", User.status == "active")
+    ).all())
+
+
 @app.post("/v1/members/{member_id}/approve")
 def approve_member(member_id: str, p: Principal = Depends(require_admin),
                    db: Session = Depends(get_db)):
@@ -582,9 +602,39 @@ def set_member_notifications(member_id: str, body: MemberNotifyBody,
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Member has no phone number")
         u.sms_enabled = body.sms_enabled
     if body.role in ("admin", "member"):
+        # Refuse to demote the last admin — that would strand the org with nobody
+        # able to administer it, including whoever is making this call.
+        if (u.role == "admin" and body.role == "member"
+                and u.status == "active" and _active_admins(db, p.tenant_id) <= 1):
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "This is the only admin — promote another member to admin first.",
+            )
         u.role = body.role
     db.commit()
     return {"ok": True, "member": _member_dict(u)}
+
+
+@app.post("/v1/members/me/leave")
+def leave_org(p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    """Remove yourself from the organization. Deletes the account, so the org's
+    roster and alert recipients no longer include you; rejoining later is the
+    normal join-by-org-code flow.
+
+    Blocked for the last remaining admin — see _active_admins()."""
+    u = db.get(User, p.user_id)
+    if not u:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "User not found")
+    if u.role == "admin" and u.status == "active" and _active_admins(db, u.tenant_id) <= 1:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "You are the only admin — promote another member to admin before leaving.",
+        )
+    email = u.email
+    db.delete(u)
+    db.execute(delete(PasswordReset).where(PasswordReset.email == email))
+    db.commit()
+    return {"ok": True}
 
 
 # ---- password reset (email OTP) -------------------------------------------- #
@@ -651,6 +701,45 @@ def reset_password(body: ResetBody, db: Session = Depends(get_db),
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid or expired code")
     user.password_hash = hash_password(body.new_password)
     db.execute(delete(PasswordReset).where(PasswordReset.email == email))
+    db.commit()
+    return {"ok": True}
+
+
+class ChangePasswordBody(BaseModel):
+    current_password: str
+    new_password: str
+
+
+@app.post("/v1/auth/change-password")
+def change_password(body: ChangePasswordBody, p: Principal = Depends(current_principal),
+                    db: Session = Depends(get_db), _rl: None = Depends(rate_limit)):
+    """Change your own password while signed in. Until now the only route was the
+    emailed-OTP reset, which is useless if SMTP isn't configured — leaving no way
+    to rotate a password that's been shared or exposed.
+
+    The CURRENT password is required, so a stolen session token alone can't lock
+    the owner out. Rate-limited like the other auth endpoints.
+
+    NOTE: this does not invalidate tokens already issued. JWTs here are stateless
+    and carry no revocation list, so any existing session stays valid until it
+    expires (JWT_EXPIRE_HOURS). To force everyone off immediately, rotate
+    JWT_SECRET — that invalidates every token, including your own.
+    """
+    user = db.get(User, p.user_id)
+    if not user:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "User not found")
+    if not verify_password(body.current_password, user.password_hash):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Current password is incorrect")
+    if len(body.new_password) < config.MIN_PASSWORD_LEN:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Password must be at least {config.MIN_PASSWORD_LEN} characters",
+        )
+    if body.new_password == body.current_password:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "New password must be different")
+    user.password_hash = hash_password(body.new_password)
+    # Any outstanding emailed reset code for this account is now moot.
+    db.execute(delete(PasswordReset).where(PasswordReset.email == user.email))
     db.commit()
     return {"ok": True}
 
@@ -1132,13 +1221,56 @@ def ingest_crash(body: CrashBody, tenant_id: str = Depends(tenant_from_api_key),
     return {"ok": True, "eui": eui}
 
 
+# A device re-uploads the SAME crash every 20s until it gives up (6 tries), because
+# the C3 counts attempts, not confirmed deliveries — so one panic lands as ~6 rows.
+# Collapse identical consecutive reports into a single entry carrying `occurrences`,
+# so the count reflects real crashes instead of retry noise. Purely a read-side view:
+# every row is still stored, and the CSV export stays raw for forensics.
+CRASH_DEDUP_WINDOW_S = 300.0
+
+
 @app.get("/v1/crashes")
-def list_crashes(p: Principal = Depends(require_admin), db: Session = Depends(get_db)):
+def list_crashes(p: Principal = Depends(require_admin), db: Session = Depends(get_db),
+                 raw: bool = False):
     rows = db.scalars(select(CrashReport).where(CrashReport.tenant_id == p.tenant_id)
-                      .order_by(CrashReport.ts.desc()).limit(500)).all()
-    return {"crashes": [{"id": c.id, "eui": c.eui, "ts": c.ts, "reset_reason": c.reset_reason,
-                         "fw": c.fw, "pc": c.pc, "backtrace": c.backtrace, "detail": c.detail}
-                        for c in rows]}
+                      .order_by(CrashReport.ts.desc()).limit(2000)).all()
+
+    def rec(c: CrashReport) -> dict:
+        return {"id": c.id, "eui": c.eui, "ts": c.ts, "reset_reason": c.reset_reason,
+                "fw": c.fw, "pc": c.pc, "backtrace": c.backtrace, "detail": c.detail}
+
+    if raw:
+        return {"crashes": [rec(c) for c in rows[:500]]}
+
+    out: list[dict] = []
+    for c in rows:                       # newest -> oldest
+        sig = (c.eui, c.reset_reason, c.pc, c.backtrace)
+        if out and out[-1]["_sig"] == sig and abs(out[-1]["first_ts"] - c.ts) <= CRASH_DEDUP_WINDOW_S:
+            out[-1]["occurrences"] += 1
+            out[-1]["first_ts"] = c.ts   # rows descend, so this walks back to the earliest retry
+            continue
+        e = rec(c)
+        e["occurrences"] = 1
+        e["first_ts"] = c.ts
+        e["_sig"] = sig
+        out.append(e)
+        if len(out) >= 500:
+            break
+    for e in out:
+        e.pop("_sig", None)
+    return {"crashes": out}
+
+
+@app.get("/v1/fleet")
+def fleet_status(p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
+    """Gateway self-report (firmware versions, free heap, role) that arrives with the
+    30s mesh push. Surfaced so a customer can watch heap headroom — a heap that
+    sawtooths down before each panic is the signature of a leak in the gateway."""
+    fs = db.get(FleetStatus, p.tenant_id)
+    if not fs:
+        return {"fleet": None}
+    return {"fleet": {"fw_c3": fs.fw_c3, "fw_c6": fs.fw_c6, "heap_free": fs.heap_free,
+                      "role": fs.role, "updated_at": fs.updated_at}}
 
 
 @app.get("/v1/crashes/export.csv")

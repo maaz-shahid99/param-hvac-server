@@ -32,11 +32,18 @@ With `ENV=production` the server refuses to start on default/weak secrets — se
 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). Never commit a real `.env` (only `.env.example`).
 
 ## Quick start (discovery-server)
+Discovery itself is already served by cloud-server above at `:8002/discovery` —
+you do **not** need a second process for it. Use this directory for the on-prem
+display node, and for `discovery_server.py` only if you deliberately want
+discovery standalone on its own port.
 ```bash
 cd discovery-server
 python -m pip install -r requirements.txt
-python discovery_server.py      # :8000   (rendezvous)
 python display_node.py          # :8001   (local dashboard) — set DISCOVERY_URL / NODE_IP as needed
+#   point DISCOVERY_URL at http://<host>:8002/discovery (the merged service)
+
+python discovery_server.py      # :8000   OPTIONAL — standalone discovery instead
+#   if you run this, set the gateway's "disc" override to it; don't run both
 ```
 
 ## Sibling repos

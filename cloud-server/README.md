@@ -1,22 +1,30 @@
 # Cloud Server — multi-tenant rack-overheat alerting
 
-The product backend. Runs on AWS (alongside the discovery server), ingests
-readings from gateways, evaluates them against per-customer thresholds, and
-alerts the customer (SES email / SNS SMS) when a server rack or data node
-overheats — or when a sensor goes silent.
+The product backend. Ingests readings from gateways, evaluates them against
+per-customer thresholds, and alerts the customer (SES email / SNS SMS) when a
+server rack or data node overheats — or when a sensor goes silent. It also
+serves the **discovery** service at `/discovery` (see `discovery_routes.py`), so
+one server on one port covers both planes.
 
 The Flutter app (`thread_commissioner/`) is the control plane (log in, configure
 the rack layout, set thresholds, view live temps and alerts); **this** service
 is the always-on engine, because a phone is not always running.
 
 ## Why this exists / how it differs from the other servers
-- `Discovery Server/discovery_server.py` — rendezvous + a presence-only "site
-  offline" email. Single-site, no accounts. **Unchanged.**
-- `Discovery Server/display_node.py` — LAN dashboard + time-series, **no
-  threshold logic**, no tenants. **Unchanged** (the gateway still posts to it for
-  the local 3D dashboard).
 - **This Cloud Server** — multi-tenant, JWT auth, API-key ingest, the threshold
   engine, and SES/SNS alerts. Every table carries a `tenant_id`.
+- `discovery_routes.py` (**mounted here at `/discovery`**) — rendezvous +
+  a presence-only "site offline" email. Single-site, no accounts, its own sqlite
+  file (`DISCOVERY_DB`). A gateway only needs this server's URL: it derives
+  `<cloud_url>/discovery` itself, so there is no second URL to provision.
+  These endpoints are **unauthenticated**, matching the old standalone service —
+  keep this port LAN-only, or firewall `/discovery/*`, if it is internet-facing.
+- `../discovery-server/discovery_server.py` — the same service as a **standalone**
+  process on `:8000`. Still supported for sites that want it separate; point the
+  gateway's `disc` override at it. Don't run both for one site.
+- `../discovery-server/display_node.py` — LAN dashboard + time-series, **no
+  threshold logic**, no tenants. **Unchanged** (the gateway still posts to it for
+  the local 3D dashboard).
 
 ## Architecture (Phase 1)
 ```

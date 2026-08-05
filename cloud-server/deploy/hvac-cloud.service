@@ -1,9 +1,16 @@
-# systemd unit to run the Cloud Server (behind the Nginx TLS proxy).
-# Install:  sudo cp hvac-cloud.service /etc/systemd/system/ && sudo systemctl enable --now hvac-cloud
+# systemd unit to run the Cloud Server.
+#
+# Don't cp this file as-is — __APP_DIR__ and __VENV_DIR__ are placeholders.
+# LOCAL_SETUP.md's install step substitutes them for your actual clone path
+# with sed before copying to /etc/systemd/system/.
 #
 # Migrations run as a one-shot BEFORE the app starts (ExecStartPre), so the
 # schema is always current on deploy. Secrets come from /etc/hvac-cloud.env
-# (DATABASE_URL, JWT_SECRET, BOOTSTRAP_TOKEN, SES_FROM, AWS_REGION, …).
+# (DATABASE_URL, JWT_SECRET, BOOTSTRAP_TOKEN, SMTP_*, …).
+#
+# --host 0.0.0.0 below is for connecting directly from the LAN (no reverse
+# proxy). If you put Nginx in front for TLS (see nginx.conf), change this to
+# --host 127.0.0.1 so the app itself isn't reachable except through Nginx.
 
 [Unit]
 Description=HVAC Cloud Server (FastAPI)
@@ -12,10 +19,10 @@ After=network.target
 [Service]
 Type=simple
 User=hvac
-WorkingDirectory=/opt/hvac/Cloud Server
+WorkingDirectory=__APP_DIR__
 EnvironmentFile=/etc/hvac-cloud.env
-ExecStartPre=/opt/hvac/venv/bin/alembic upgrade head
-ExecStart=/opt/hvac/venv/bin/uvicorn app:app --host 127.0.0.1 --port 8002 --workers 4
+ExecStartPre=__VENV_DIR__/bin/alembic upgrade head
+ExecStart=__VENV_DIR__/bin/uvicorn app:app --host 0.0.0.0 --port 8002 --workers 4
 Restart=always
 RestartSec=3
 

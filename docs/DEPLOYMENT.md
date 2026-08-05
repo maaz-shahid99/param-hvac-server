@@ -5,8 +5,10 @@ notes the **current state in this repo** and what to change. Priorities:
 🔴 = blocker before first customer · 🟡 = soon after first install.
 
 > **Deployment model assumed:** Cloud Server hosted by the vendor in **AWS**
-> (multi-tenant SaaS); the `Discovery Server/display_node.py` LAN dashboard is
-> optional on-site. The discovery server is single-site rendezvous only.
+> (multi-tenant SaaS); the `discovery-server/display_node.py` LAN dashboard is
+> optional on-site. Discovery is single-site rendezvous only, and now rides on the
+> Cloud Server at `/discovery` (running `discovery-server/` standalone on `:8000`
+> remains supported).
 >
 > **Running locally / on-prem instead** (on a PC or a node at the rack, no AWS)?
 > Most of §1–§3 below does not apply — see **`Cloud Server/deploy/LOCAL_SETUP.md`**.
@@ -44,7 +46,7 @@ notes the **current state in this repo** and what to change. Priorities:
 - [ ] 🟡 App **versioning** (pubspec version + build numbers) tied to releases.
 
 ## 3. Firmware / gateway
-- [ ] 🔴 **Production URLs + TLS on the C3.** `Bridge.ino` bakes a dev IP (`DEFAULT_DISCOVERY_URL "http://10.14.98.109:8000"`, empty `DEFAULT_CLOUD_URL`) over plain HTTP. HTTPS cloud requires `WiFiClientSecure` + CA cert/pinning — a real change, not just a string swap.
+- [ ] 🔴 **Production URLs + TLS on the C3.** `Bridge.ino` no longer bakes in a dev IP — `DEFAULT_DISCOVERY_URL` is empty and discovery is derived from the provisioned cloud URL (`<cloud>/discovery`), so the only URL to set is `cloud` (`DEFAULT_CLOUD_URL` is empty; it's provisioned over BLE). What remains is TLS: the default is plain HTTP, and an HTTPS cloud requires `WiFiClientSecure` + CA cert/pinning — a real change, not just a string swap.
 - [x] 🟡 **Cloud firmware/OTA hosting** — the Cloud Server now hosts `/firmware/manifest.json` + images and orchestrates **tiered OTA**: the gateway polls `/v1/ota/check` (v19+) and self-updates; mandatory auto-rolls, optional waits for in-app approval, **canary → promote** rolls the gateway first. Publish from the **field-console**. *Remaining ops:* per-device identity + QR generation + the factory-flash procedure.
 - [ ] 🟡 **Radio regulatory certification** (FCC/CE for 802.15.4) + enclosure/power if selling the hardware.
 
