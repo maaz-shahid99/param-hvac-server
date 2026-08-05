@@ -664,6 +664,45 @@ def reset_password(body: ResetBody, db: Session = Depends(get_db),
     return {"ok": True}
 
 
+class ChangePasswordBody(BaseModel):
+    current_password: str
+    new_password: str
+
+
+@app.post("/v1/auth/change-password")
+def change_password(body: ChangePasswordBody, p: Principal = Depends(current_principal),
+                    db: Session = Depends(get_db), _rl: None = Depends(rate_limit)):
+    """Change your own password while signed in. Until now the only route was the
+    emailed-OTP reset, which is useless if SMTP isn't configured — leaving no way
+    to rotate a password that's been shared or exposed.
+
+    The CURRENT password is required, so a stolen session token alone can't lock
+    the owner out. Rate-limited like the other auth endpoints.
+
+    NOTE: this does not invalidate tokens already issued. JWTs here are stateless
+    and carry no revocation list, so any existing session stays valid until it
+    expires (JWT_EXPIRE_HOURS). To force everyone off immediately, rotate
+    JWT_SECRET — that invalidates every token, including your own.
+    """
+    user = db.get(User, p.user_id)
+    if not user:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "User not found")
+    if not verify_password(body.current_password, user.password_hash):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Current password is incorrect")
+    if len(body.new_password) < config.MIN_PASSWORD_LEN:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Password must be at least {config.MIN_PASSWORD_LEN} characters",
+        )
+    if body.new_password == body.current_password:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "New password must be different")
+    user.password_hash = hash_password(body.new_password)
+    # Any outstanding emailed reset code for this account is now moot.
+    db.execute(delete(PasswordReset).where(PasswordReset.email == user.email))
+    db.commit()
+    return {"ok": True}
+
+
 # ---- API keys (gateway credential) ----------------------------------------- #
 
 class ApiKeyBody(BaseModel):
