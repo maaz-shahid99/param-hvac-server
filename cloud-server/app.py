@@ -80,7 +80,7 @@ from db import (
     now,
 )
 from notifications import notify_email
-from thresholds import _clear_alert, evaluate_reading
+from thresholds import _clear_alert, evaluate_humidity, evaluate_reading
 
 
 # --------------------------------------------------------------------------- #
@@ -1088,15 +1088,25 @@ class ThresholdBody(BaseModel):
     high_c: float
     delta_c: float
     enabled: bool = True
+    # Humidity band, %RH. Optional so an older client that doesn't know about
+    # humidity can still PUT a temperature limit without silently wiping it.
+    hum_min: float | None = None
+    hum_max: float | None = None
+    hum_enabled: bool | None = None
 
 
 @app.get("/v1/thresholds")
 def get_thresholds(p: Principal = Depends(current_principal), db: Session = Depends(get_db)):
     rows = db.scalars(select(Threshold).where(Threshold.tenant_id == p.tenant_id)).all()
     return {
-        "defaults": {"high_c": config.DEFAULT_HIGH_C, "delta_c": config.DEFAULT_DELTA_C},
+        "defaults": {
+            "high_c": config.DEFAULT_HIGH_C, "delta_c": config.DEFAULT_DELTA_C,
+            "hum_min": config.DEFAULT_HUM_MIN, "hum_max": config.DEFAULT_HUM_MAX,
+        },
         "thresholds": [{"scope": t.scope, "scope_id": t.scope_id, "high_c": t.high_c,
-                        "delta_c": t.delta_c, "enabled": t.enabled} for t in rows],
+                        "delta_c": t.delta_c, "enabled": t.enabled,
+                        "hum_min": t.hum_min, "hum_max": t.hum_max,
+                        "hum_enabled": t.hum_enabled} for t in rows],
     }
 
 
@@ -1105,16 +1115,31 @@ def put_threshold(body: ThresholdBody, p: Principal = Depends(require_admin),
                   db: Session = Depends(get_db)):
     if body.scope not in ("tenant", "rack", "port"):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "scope must be tenant|rack|port")
+    # Validate the band before it can be stored: an inverted or out-of-range band
+    # would either never fire or fire permanently, and silently — the operator
+    # would believe humidity was being watched when it wasn't.
+    if body.hum_min is not None and body.hum_max is not None:
+        if not (0 <= body.hum_min < body.hum_max <= 100):
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "Humidity band must satisfy 0 <= min < max <= 100 (%RH).")
     existing = db.scalar(select(Threshold).where(
         Threshold.tenant_id == p.tenant_id, Threshold.scope == body.scope,
         Threshold.scope_id == body.scope_id,
     ))
     if existing:
         existing.high_c, existing.delta_c, existing.enabled = body.high_c, body.delta_c, body.enabled
+        # Only touch the humidity fields the caller actually sent.
+        if body.hum_min is not None:     existing.hum_min = body.hum_min
+        if body.hum_max is not None:     existing.hum_max = body.hum_max
+        if body.hum_enabled is not None: existing.hum_enabled = body.hum_enabled
     else:
         db.add(Threshold(id=new_id(), tenant_id=p.tenant_id, scope=body.scope,
                          scope_id=body.scope_id, high_c=body.high_c,
-                         delta_c=body.delta_c, enabled=body.enabled))
+                         delta_c=body.delta_c, enabled=body.enabled,
+                         hum_min=(body.hum_min if body.hum_min is not None else config.DEFAULT_HUM_MIN),
+                         hum_max=(body.hum_max if body.hum_max is not None else config.DEFAULT_HUM_MAX),
+                         hum_enabled=bool(body.hum_enabled)))
     db.commit()
     return {"ok": True}
 
@@ -1224,6 +1249,13 @@ def ingest_env(body: EnvBody, tenant_id: str = Depends(tenant_from_api_key),
                       temp=_num(body.temp), hum=_num(body.hum),
                       pres=_num(body.pres), voc=_num(body.voc)))
     db.commit()
+    # Humidity band check. Same place in the pipeline as the temperature check in
+    # /v1/readings: evaluate on ingest, so an alert fires on the sample that
+    # crossed the limit rather than waiting for a scan. No-ops unless the tenant
+    # has opted in via Threshold.hum_enabled.
+    names = _device_names(db, tenant_id)
+    evaluate_humidity(db, tenant_id, eui, _num(body.hum), recipients_for(db, tenant_id),
+                      names.get(eui) or f"router {eui}")
     return {"ok": True, "eui": eui}
 
 

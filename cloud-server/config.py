@@ -116,6 +116,13 @@ MIN_PASSWORD_LEN = _i("MIN_PASSWORD_LEN", 6)
 DEFAULT_HIGH_C = _f("DEFAULT_HIGH_C", 40.0)
 DEFAULT_DELTA_C = _f("DEFAULT_DELTA_C", 20.0)
 HYSTERESIS_C = _f("HYSTERESIS_C", 3.0)
+# Relative-humidity band (%RH) for the router/gateway BME sample. Wide defaults
+# on purpose: humidity alerting is opt-in per tenant (Threshold.hum_enabled), and
+# these only apply to a tenant that has never saved a limit, so they must not
+# fire on a site that simply upgraded.
+DEFAULT_HUM_MIN = _f("DEFAULT_HUM_MIN", 30.0)
+DEFAULT_HUM_MAX = _f("DEFAULT_HUM_MAX", 70.0)
+HYSTERESIS_RH = _f("HYSTERESIS_RH", 3.0)
 ALERT_COOLDOWN_S = _f("ALERT_COOLDOWN_S", 900.0)
 STALE_AFTER_S = _f("STALE_AFTER_S", 180.0)
 WATCHDOG_INTERVAL_S = _f("WATCHDOG_INTERVAL_S", 30.0)

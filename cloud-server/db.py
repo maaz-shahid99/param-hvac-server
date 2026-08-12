@@ -144,8 +144,15 @@ class SensorMap(Base):
 
 
 class Threshold(Base):
-    """A high-temp / delta limit. scope='tenant' is the default; 'rack' or 'port'
-    overrides for a specific rack_id/port_id (resolution order port > rack > tenant)."""
+    """A high-temp / delta / humidity limit. scope='tenant' is the default; 'rack'
+    or 'port' overrides for a specific rack_id/port_id (resolution order
+    port > rack > tenant).
+
+    Humidity is a BAND (min and max), unlike temperature which only has an upper
+    bound — air that is too dry is an ESD risk and air that is too damp risks
+    condensation, so both ends matter. It is also measured per ROUTER/GATEWAY by
+    the BME280, not per rack probe (the DS18B20s are temperature only), so only
+    the tenant-scope row is consulted for it."""
     __tablename__ = "thresholds"
     id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
     tenant_id: Mapped[str] = mapped_column(String(32), ForeignKey("tenants.id"), index=True)
@@ -154,6 +161,12 @@ class Threshold(Base):
     high_c: Mapped[float] = mapped_column(Float)
     delta_c: Mapped[float] = mapped_column(Float)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Relative humidity band, %RH.
+    hum_min: Mapped[float] = mapped_column(Float, default=0.0, server_default="0")
+    hum_max: Mapped[float] = mapped_column(Float, default=100.0, server_default="100")
+    # Opt-in: an existing site upgrading to this build must not suddenly start
+    # emailing about humidity it never asked to be alerted on.
+    hum_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
     __table_args__ = (Index("ix_threshold_scope", "tenant_id", "scope", "scope_id", unique=True),)
 
 
@@ -320,6 +333,38 @@ class SingletonLease(Base):
     expires_at: Mapped[float] = mapped_column(Float, default=0.0)
 
 
+def _sqlite_add_missing_columns() -> None:
+    """Add columns this build expects but an older SQLite file lacks.
+
+    `create_all` creates missing TABLES but never alters an existing one, so a
+    site that has been running for months keeps its old `thresholds` table and
+    every query naming a new column fails with "no such column". Alembic owns
+    the real schema, but the on-prem appliance is deployed by `git pull` +
+    restart with no migration step, so without this a new column means a broken
+    server until someone remembers to run alembic by hand.
+
+    Strictly additive and idempotent: it only ever ADDs a column that is absent,
+    never drops, renames or backfills. Postgres is untouched — Alembic owns it.
+    """
+    additive: dict[str, list[tuple[str, str]]] = {
+        # table -> [(column, DDL type + default)]
+        "thresholds": [
+            ("hum_min", "FLOAT NOT NULL DEFAULT 0"),
+            ("hum_max", "FLOAT NOT NULL DEFAULT 100"),
+            ("hum_enabled", "BOOLEAN NOT NULL DEFAULT 0"),
+        ],
+    }
+    with engine.begin() as conn:
+        for table, cols in additive.items():
+            existing = {row[1] for row in conn.exec_driver_sql(f"PRAGMA table_info({table})")}
+            if not existing:
+                continue                      # table not created yet; create_all handles it
+            for name, ddl in cols:
+                if name not in existing:
+                    conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+                    print(f"[db] added {table}.{name}")
+
+
 def init_db() -> None:
     """Bootstrap the schema for local dev / tests on SQLite. On a real database
     (Postgres) the schema is owned by Alembic — run `alembic upgrade head`
@@ -327,3 +372,4 @@ def init_db() -> None:
     and confuse migrations)."""
     if DATABASE_URL.startswith("sqlite"):
         Base.metadata.create_all(engine)
+        _sqlite_add_missing_columns()

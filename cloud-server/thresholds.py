@@ -122,11 +122,19 @@ def _dispatch(recipients, kind: str, location: str, value: float,
         body = f"{location} is reporting again."
     else:
         # 'stale' covers both sensors and routers, so keep the label generic.
-        label = {"high_temp": "HIGH TEMPERATURE", "delta": "HIGH ΔT", "stale": "OFFLINE"}.get(kind, kind)
+        label = {"high_temp": "HIGH TEMPERATURE", "delta": "HIGH ΔT", "stale": "OFFLINE",
+                 "hum_high": "HIGH HUMIDITY", "hum_low": "LOW HUMIDITY"}.get(kind, kind)
         verb = "ALERT" if opened else "REMINDER"
         subject = f"[HVAC {verb}] {label} — {location}"
         if kind == "stale":
             body = f"{location} has stopped reporting.\nNo data for over {config.STALE_AFTER_S:.0f}s."
+        elif kind in ("hum_high", "hum_low"):
+            # Humidity is a band, so say which end was crossed and in which
+            # direction — "%RH: 78 (limit 70)" alone doesn't tell you whether
+            # that limit was a floor or a ceiling.
+            side = "above the maximum" if kind == "hum_high" else "below the minimum"
+            body = (f"{location}\nRelative humidity {value:.1f}%RH is {side} "
+                    f"of {threshold:.1f}%RH.")
         else:
             body = (f"{location}\n{label}: {value:.1f}°C "
                     f"(limit {threshold:.1f}°C).")
@@ -221,6 +229,60 @@ def evaluate_reading(db: Session, tenant_id: str, eui: str, probes: list[dict],
         _clear_alert(db, tenant_id, eui, "high_temp")
     if sm and sm.unit_id:
         _evaluate_delta(db, tenant_id, sm.unit_id, delta_c, recipients)
+
+
+def evaluate_humidity(db: Session, tenant_id: str, eui: str, hum: float | None,
+                      recipients, label: str = "") -> None:
+    """Evaluate one router/gateway BME humidity sample against the tenant band.
+
+    Called from the /v1/env ingest path. Humidity differs from temperature in
+    three ways that shape this:
+
+      * it is a BAND — too dry is an ESD risk, too damp risks condensation — so
+        there are two independent alert kinds rather than one ceiling;
+      * it is measured per DEVICE (the BME on a router/gateway), not per rack
+        probe, so only the tenant-scope row applies — a rack/port override would
+        have nothing to attach to;
+      * it is OPT-IN (`hum_enabled`). A site upgrading to this build has never
+        chosen a humidity limit, and inventing one for them would mean emailing
+        about a condition they never asked to watch.
+
+    hum_low and hum_high are separate kinds so each clears on its own side of
+    the band. They cannot both be open at once — a reading can't be under the
+    floor and over the ceiling — so the (tenant, eui, kind) dedup still holds.
+    """
+    if hum is None:
+        return
+    try:
+        h = float(hum)
+    except (TypeError, ValueError):
+        return
+    # A BME that has failed or been disconnected commonly reports exactly 0 or a
+    # wild value; alerting "LOW HUMIDITY 0%" on a dead sensor is noise, not signal.
+    if not (0.0 < h <= 100.0):
+        return
+
+    t = db.scalar(select(Threshold).where(
+        Threshold.tenant_id == tenant_id, Threshold.scope == "tenant"))
+    if t is None or not getattr(t, "hum_enabled", False):
+        return                                   # opt-in; nothing configured yet
+    lo = t.hum_min if t.hum_min is not None else config.DEFAULT_HUM_MIN
+    hi = t.hum_max if t.hum_max is not None else config.DEFAULT_HUM_MAX
+    if lo >= hi:
+        return                                   # nonsensical band; treat as off
+
+    loc = label or f"sensor {eui}"
+    key_hi, key_lo = f"{eui}:hum_high", f"{eui}:hum_low"
+
+    if h >= hi:
+        _open_alert(db, tenant_id, recipients, key_hi, "hum_high", loc, h, hi)
+    elif h <= hi - config.HYSTERESIS_RH:
+        _clear_alert(db, tenant_id, key_hi, "hum_high")
+
+    if h <= lo:
+        _open_alert(db, tenant_id, recipients, key_lo, "hum_low", loc, h, lo)
+    elif h >= lo + config.HYSTERESIS_RH:
+        _clear_alert(db, tenant_id, key_lo, "hum_low")
 
 
 def _granularity(db: Session, tenant_id: str) -> str:
