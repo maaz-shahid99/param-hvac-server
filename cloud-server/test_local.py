@@ -370,6 +370,12 @@ with client:  # triggers lifespan (init_db + watchdog)
     man = client.get("/firmware/manifest.json")
     check(man.status_code == 200 and man.json()["c3_version"] == 18 and man.json()["c3_severity"] == "optional",
           "manifest served at /firmware with severity")
+    # The image FILENAME had no coverage, which is exactly how the manifest came
+    # to publish "c3file" while Bridge.ino reads "c3_file": every OTA resolved an
+    # empty filename, skipped the download and reported "up-to-date". Assert both
+    # spellings so the server can never again advertise a build the fleet can't fetch.
+    check(man.json().get("c3_file") == "c3_v18.bin" and man.json().get("c3file") == "c3_v18.bin",
+          "manifest names the image under both key spellings the fleet reads")
     check(client.get("/firmware/c3_v18.bin").content == b"\x00\x01\x02fakebin", "firmware bin served")
     # gateway poll: optional + not yet approved
     chk = client.get("/v1/ota/check", headers=h).json()
