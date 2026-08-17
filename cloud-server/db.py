@@ -308,6 +308,14 @@ class FleetStatus(Base):
     fw_c6: Mapped[int] = mapped_column(Integer, default=0)
     heap_free: Mapped[int] = mapped_column(Integer, default=0)
     role: Mapped[str] = mapped_column(String(16), default="")
+    # Pending remote restart, collected by the gateway on its next /v1/mesh post.
+    # The server cannot reach the gateway, so a request has to wait for the poll.
+    # ONE-SHOT: cleared the instant it is handed out. A flag that survived
+    # delivery would restart the gateway every 30 s forever and the only recovery
+    # would be a cable — the exact failure this feature exists to avoid.
+    # "" | "c3" | "c6" | "both"
+    reboot_req: Mapped[str] = mapped_column(String(8), default="")
+    reboot_at: Mapped[float] = mapped_column(Float, default=0.0)
     updated_at: Mapped[float] = mapped_column(Float, default=now)
 
 
@@ -352,6 +360,10 @@ def _sqlite_add_missing_columns() -> None:
             ("hum_min", "FLOAT NOT NULL DEFAULT 0"),
             ("hum_max", "FLOAT NOT NULL DEFAULT 100"),
             ("hum_enabled", "BOOLEAN NOT NULL DEFAULT 0"),
+        ],
+        "fleet_status": [
+            ("reboot_req", "VARCHAR(8) NOT NULL DEFAULT ''"),
+            ("reboot_at", "FLOAT NOT NULL DEFAULT 0"),
         ],
     }
     with engine.begin() as conn:

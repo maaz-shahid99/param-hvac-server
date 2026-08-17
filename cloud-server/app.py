@@ -964,8 +964,8 @@ def ingest_mesh(body: MeshBody, tenant_id: str = Depends(tenant_from_api_key),
     'gateway' kind moves on failover. The optional self-report (fw/heap/role) is
     upserted into FleetStatus for the support console + OTA version comparison."""
     ts = now()
+    fs = db.get(FleetStatus, tenant_id)
     if any(v is not None for v in (body.fw_c3, body.fw_c6, body.heap_free, body.role)):
-        fs = db.get(FleetStatus, tenant_id)
         if not fs:
             fs = FleetStatus(tenant_id=tenant_id)
             db.add(fs)
@@ -996,8 +996,19 @@ def ingest_mesh(body: MeshBody, tenant_id: str = Depends(tenant_from_api_key),
             row.kind = kind
         else:
             db.add(MeshNode(tenant_id=tenant_id, eui=eui, kind=kind, last_seen=ts))
+
+    # Hand out any pending remote restart and clear it in the SAME transaction.
+    # This 30 s post is the only channel to the gateway — nothing can be pushed —
+    # so an admin's request waits here until the gateway comes to collect it.
+    # Clearing on delivery is the safety property, not an optimisation: a flag
+    # left set would restart the gateway on every poll, forever, and the only way
+    # to stop it would be physical access.
+    reboot = ""
+    if fs and fs.reboot_req:
+        reboot = fs.reboot_req
+        fs.reboot_req = ""
     db.commit()
-    return {"ok": True, "nodes": len(items)}
+    return {"ok": True, "nodes": len(items), "reboot": reboot}
 
 
 # ---- topology sync (replaces app-local SharedPreferences) ------------------ #
@@ -1543,7 +1554,38 @@ def fleet_status(p: Principal = Depends(current_principal), db: Session = Depend
     if not fs:
         return {"fleet": None}
     return {"fleet": {"fw_c3": fs.fw_c3, "fw_c6": fs.fw_c6, "heap_free": fs.heap_free,
-                      "role": fs.role, "updated_at": fs.updated_at}}
+                      "role": fs.role, "updated_at": fs.updated_at,
+                      # Non-empty while a restart is waiting to be collected, so the
+                      # dashboard can say "requested" instead of looking like the
+                      # button did nothing for up to 30 s.
+                      "reboot_req": fs.reboot_req, "reboot_at": fs.reboot_at}}
+
+
+class GatewayRebootBody(BaseModel):
+    target: str = "c3"
+
+
+@app.post("/v1/gateway/reboot")
+def gateway_reboot(body: GatewayRebootBody, p: Principal = Depends(require_admin),
+                   db: Session = Depends(get_db)):
+    """Queue a restart for the gateway. Admin-only, and deliberately not immediate:
+    nothing can reach the gateway, so the request parks here until its next 30 s
+    mesh post collects it.
+
+    `c6` restarts the Thread radio — that drops the whole mesh briefly and closes
+    any open commissioning window, so it is the heavier of the two. `c3` restarts
+    only the Wi-Fi/BLE uplink and leaves the mesh up."""
+    target = body.target.lower().strip()
+    if target not in ("c3", "c6", "both"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "target must be c3, c6 or both")
+    fs = db.get(FleetStatus, p.tenant_id)
+    if not fs:
+        fs = FleetStatus(tenant_id=p.tenant_id)
+        db.add(fs)
+    fs.reboot_req = target
+    fs.reboot_at = now()
+    db.commit()
+    return {"ok": True, "target": target, "eta_s": 30}
 
 
 @app.get("/v1/crashes/export.csv")
@@ -1834,18 +1876,35 @@ def _latest_release(db: Session, kind: str) -> FirmwareRelease | None:
                                FirmwareRelease.created_at.desc()).limit(1))
 
 
+def _fw_entry(rel: FirmwareRelease | None, kind: str) -> dict:
+    """One chip's block of the manifest / OTA-check payload.
+
+    The image filename is emitted under BOTH spellings deliberately. The C3 reads
+    "<kind>_file" (Bridge.ino performOtaCheck / performOtaC6 / performFleetOta)
+    while this server only ever wrote "<kind>file", so every OTA silently no-opped:
+    the filename came back empty and the firmware reported "up-to-date" without
+    downloading anything. Fixing only the firmware is a chicken-and-egg — it takes
+    a cable to deliver the fix that makes over-the-air updates work — so the server
+    speaks both spellings and the already-deployed fleet starts working as-is.
+    Drop "<kind>file" once no C3 older than v20 remains in the field.
+    """
+    name = rel.filename if rel else ""
+    return {
+        f"{kind}_version": rel.version if rel else 0,
+        f"{kind}_file": name,           # what the deployed firmware reads
+        f"{kind}file": name,            # what this server has always written
+        f"{kind}_severity": rel.severity if rel else "optional",
+        f"{kind}_sha256": rel.sha256 if rel else "",
+    }
+
+
 def _write_manifest(db: Session) -> dict:
     """Regenerate firmware/manifest.json from the newest release per chip, in the
-    exact shape the C3 OTA reader expects (c3_version/c3file, c6_version/c6file)
-    plus severity + sha256 for the tiered rollout + integrity."""
+    shape the C3 OTA reader expects, plus severity + sha256 for the tiered rollout
+    + integrity."""
     os.makedirs(config.FIRMWARE_DIR, exist_ok=True)
-    c3, c6 = _latest_release(db, "c3"), _latest_release(db, "c6")
-    manifest = {
-        "c3_version": c3.version if c3 else 0, "c3file": c3.filename if c3 else "",
-        "c3_severity": c3.severity if c3 else "optional", "c3_sha256": c3.sha256 if c3 else "",
-        "c6_version": c6.version if c6 else 0, "c6file": c6.filename if c6 else "",
-        "c6_severity": c6.severity if c6 else "optional", "c6_sha256": c6.sha256 if c6 else "",
-    }
+    manifest = {**_fw_entry(_latest_release(db, "c3"), "c3"),
+                **_fw_entry(_latest_release(db, "c6"), "c6")}
     with open(os.path.join(config.FIRMWARE_DIR, "manifest.json"), "w", encoding="utf-8") as fh:
         json.dump(manifest, fh)
     return manifest
@@ -1927,7 +1986,7 @@ def firmware_manifest():
     path = os.path.join(config.FIRMWARE_DIR, "manifest.json")
     if os.path.isfile(path):
         return FileResponse(path, media_type="application/json")
-    return {"c3_version": 0, "c3file": "", "c6_version": 0, "c6file": ""}
+    return {**_fw_entry(None, "c3"), **_fw_entry(None, "c6")}
 
 
 @app.get("/firmware/{filename}")
@@ -1948,10 +2007,8 @@ def ota_check(tenant_id: str = Depends(tenant_from_api_key), db: Session = Depen
     c3, c6 = _latest_release(db, "c3"), _latest_release(db, "c6")
     st = db.get(OtaState, tenant_id)
     return {
-        "c3_version": c3.version if c3 else 0, "c3file": c3.filename if c3 else "",
-        "c3_severity": c3.severity if c3 else "optional", "c3_stage": c3.stage if c3 else "full",
-        "c6_version": c6.version if c6 else 0, "c6file": c6.filename if c6 else "",
-        "c6_severity": c6.severity if c6 else "optional", "c6_stage": c6.stage if c6 else "full",
+        **_fw_entry(c3, "c3"), "c3_stage": c3.stage if c3 else "full",
+        **_fw_entry(c6, "c6"), "c6_stage": c6.stage if c6 else "full",
         "approved_c3": st.approved_c3 if st else 0,
         "approved_c6": st.approved_c6 if st else 0,
     }

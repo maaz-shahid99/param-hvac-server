@@ -358,6 +358,20 @@ with client:  # triggers lifespan (init_db + watchdog)
     acme = next(t for t in client.get("/v1/support/overview", headers=sup).json()["tenants"]
                 if "Acme" in t["tenant"])
     check(acme["fw_c3"] == 17 and acme["role"] == "LEADER", "fleet status (fw/role) reported via /v1/mesh")
+    # remote gateway restart: queued by an admin, collected on the gateway's next
+    # mesh post, and cleared the instant it is handed out.
+    check(client.post("/v1/gateway/reboot", headers=auth, json={"target": "nope"}).status_code == 400,
+          "reboot rejects an unknown target")
+    check(client.post("/v1/gateway/reboot", headers=auth, json={"target": "both"}).status_code == 200,
+          "admin queues a gateway restart")
+    check(client.get("/v1/fleet", headers=auth).json()["fleet"]["reboot_req"] == "both",
+          "queued restart is visible to the dashboard while pending")
+    r1 = client.post("/v1/mesh", headers=h, json={"nodes": [{"eui": RID, "role": "G"}]})
+    check(r1.json().get("reboot") == "both", "gateway collects the restart on its mesh post")
+    # THE safety property: a flag that survived delivery would restart the gateway
+    # on every 30s poll forever, recoverable only with physical access.
+    r2 = client.post("/v1/mesh", headers=h, json={"nodes": [{"eui": RID, "role": "G"}]})
+    check(r2.json().get("reboot") == "", "restart is ONE-SHOT — cleared on delivery, no reboot loop")
     check(client.get("/v1/support/crashes?format=csv", headers=sup).text.startswith("timestamp,tenant,eui"),
           "support crashes CSV (cross-tenant)")
     check(client.get("/v1/support/env", headers=sup).status_code == 200
@@ -370,6 +384,12 @@ with client:  # triggers lifespan (init_db + watchdog)
     man = client.get("/firmware/manifest.json")
     check(man.status_code == 200 and man.json()["c3_version"] == 18 and man.json()["c3_severity"] == "optional",
           "manifest served at /firmware with severity")
+    # The image FILENAME had no coverage, which is exactly how the manifest came
+    # to publish "c3file" while Bridge.ino reads "c3_file": every OTA resolved an
+    # empty filename, skipped the download and reported "up-to-date". Assert both
+    # spellings so the server can never again advertise a build the fleet can't fetch.
+    check(man.json().get("c3_file") == "c3_v18.bin" and man.json().get("c3file") == "c3_v18.bin",
+          "manifest names the image under both key spellings the fleet reads")
     check(client.get("/firmware/c3_v18.bin").content == b"\x00\x01\x02fakebin", "firmware bin served")
     # gateway poll: optional + not yet approved
     chk = client.get("/v1/ota/check", headers=h).json()
