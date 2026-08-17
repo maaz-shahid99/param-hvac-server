@@ -964,8 +964,8 @@ def ingest_mesh(body: MeshBody, tenant_id: str = Depends(tenant_from_api_key),
     'gateway' kind moves on failover. The optional self-report (fw/heap/role) is
     upserted into FleetStatus for the support console + OTA version comparison."""
     ts = now()
+    fs = db.get(FleetStatus, tenant_id)
     if any(v is not None for v in (body.fw_c3, body.fw_c6, body.heap_free, body.role)):
-        fs = db.get(FleetStatus, tenant_id)
         if not fs:
             fs = FleetStatus(tenant_id=tenant_id)
             db.add(fs)
@@ -996,8 +996,19 @@ def ingest_mesh(body: MeshBody, tenant_id: str = Depends(tenant_from_api_key),
             row.kind = kind
         else:
             db.add(MeshNode(tenant_id=tenant_id, eui=eui, kind=kind, last_seen=ts))
+
+    # Hand out any pending remote restart and clear it in the SAME transaction.
+    # This 30 s post is the only channel to the gateway — nothing can be pushed —
+    # so an admin's request waits here until the gateway comes to collect it.
+    # Clearing on delivery is the safety property, not an optimisation: a flag
+    # left set would restart the gateway on every poll, forever, and the only way
+    # to stop it would be physical access.
+    reboot = ""
+    if fs and fs.reboot_req:
+        reboot = fs.reboot_req
+        fs.reboot_req = ""
     db.commit()
-    return {"ok": True, "nodes": len(items)}
+    return {"ok": True, "nodes": len(items), "reboot": reboot}
 
 
 # ---- topology sync (replaces app-local SharedPreferences) ------------------ #
@@ -1543,7 +1554,38 @@ def fleet_status(p: Principal = Depends(current_principal), db: Session = Depend
     if not fs:
         return {"fleet": None}
     return {"fleet": {"fw_c3": fs.fw_c3, "fw_c6": fs.fw_c6, "heap_free": fs.heap_free,
-                      "role": fs.role, "updated_at": fs.updated_at}}
+                      "role": fs.role, "updated_at": fs.updated_at,
+                      # Non-empty while a restart is waiting to be collected, so the
+                      # dashboard can say "requested" instead of looking like the
+                      # button did nothing for up to 30 s.
+                      "reboot_req": fs.reboot_req, "reboot_at": fs.reboot_at}}
+
+
+class GatewayRebootBody(BaseModel):
+    target: str = "c3"
+
+
+@app.post("/v1/gateway/reboot")
+def gateway_reboot(body: GatewayRebootBody, p: Principal = Depends(require_admin),
+                   db: Session = Depends(get_db)):
+    """Queue a restart for the gateway. Admin-only, and deliberately not immediate:
+    nothing can reach the gateway, so the request parks here until its next 30 s
+    mesh post collects it.
+
+    `c6` restarts the Thread radio — that drops the whole mesh briefly and closes
+    any open commissioning window, so it is the heavier of the two. `c3` restarts
+    only the Wi-Fi/BLE uplink and leaves the mesh up."""
+    target = body.target.lower().strip()
+    if target not in ("c3", "c6", "both"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "target must be c3, c6 or both")
+    fs = db.get(FleetStatus, p.tenant_id)
+    if not fs:
+        fs = FleetStatus(tenant_id=p.tenant_id)
+        db.add(fs)
+    fs.reboot_req = target
+    fs.reboot_at = now()
+    db.commit()
+    return {"ok": True, "target": target, "eta_s": 30}
 
 
 @app.get("/v1/crashes/export.csv")
